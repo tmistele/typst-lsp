@@ -58,7 +58,7 @@ impl Model for LazyImagesModel {
 
                 let page = source_document.pages.get(row).unwrap();
 
-                let pixmap = typst_render::render(page, 1.33, typst::visualize::Color::WHITE);
+                let pixmap = typst_render::render(page, 3.0, typst::visualize::Color::WHITE);
                 let width = pixmap.width();
                 let height = pixmap.height();
                 let pixel_buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
@@ -160,7 +160,7 @@ slint::slint! {
             // TODO: zoom?
             for image_source[i] in image_sources : Image {
                 source: image_source;
-                width: image_source.width * 1px;
+                width: (image_source.width/3) * 1px;
                 x: max(0px, (parent.width - self.width) / 2);
             }
         }
