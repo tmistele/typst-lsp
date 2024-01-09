@@ -16,6 +16,7 @@ pub struct LazyImagesModel {
     images: RefCell<Vec<Option<slint::Image>>>,
     source_document: RefCell<Option<Arc<Document>>>,
     notify: ModelNotify,
+    zoom: RefCell<f32>,
 }
 
 impl LazyImagesModel {
@@ -26,12 +27,20 @@ impl LazyImagesModel {
         self.notify.reset();
     }
 
+    pub fn set_zoom(&self, zoom: f32) {
+        *self.zoom.borrow_mut() = zoom.abs().max(0.3).min(3.0);
+        let len = self.images.borrow().len();
+        *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(len).collect();
+        self.notify.reset();
+    }
+
     pub fn new(doc: Option<Arc<Document>>) -> Self {
         let len = doc.as_ref().map(|x| x.pages.len()).unwrap_or(0);
         LazyImagesModel {
             images: RefCell::new(std::iter::repeat_with(|| None).take(len).collect()),
             source_document: RefCell::new(doc),
             notify: Default::default(),
+            zoom: RefCell::new(1.0),
         }
     }
 }
@@ -58,7 +67,9 @@ impl Model for LazyImagesModel {
 
                 let page = source_document.pages.get(row).unwrap();
 
-                let pixmap = typst_render::render(page, 3.0, typst::visualize::Color::WHITE);
+                let zoom = self.zoom.borrow().clone();
+
+                let pixmap = typst_render::render(page, zoom * 3.0, typst::visualize::Color::WHITE);
                 let width = pixmap.width();
                 let height = pixmap.height();
                 let pixel_buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
@@ -76,7 +87,6 @@ impl Model for LazyImagesModel {
 
     fn set_row_data(&self, row: usize, data: Self::Data) {
         if row < self.row_count() {
-            tracing::error!("UPDATING ROW DATA");
             self.images.borrow_mut()[row] = Some(data);
             self.notify.row_changed(row);
         }
@@ -116,6 +126,12 @@ impl Ui {
                     main_window.set_image_sources(slint::ModelRc::new(model.clone()))
                 });
 
+                main_window.on_zoom_changed(|zoom| {
+                    IMAGES_MODEL.with(|model| {
+                        model.set_zoom(zoom);
+                    })
+                });
+
                 if let Err(_) = tx.send(main_window.as_weak()) {
                     // TODO: error handling?
                 } else {
@@ -152,16 +168,27 @@ impl Ui {
 }
 
 slint::slint! {
-    import { ListView } from "std-widgets.slint";
+    import { ListView, Slider } from "std-widgets.slint";
     export component MainWindow inherits Window {
         in property <[image]> image_sources;
+        callback zoom_changed <=> zoom.changed;
+        zoom := Slider {
+            minimum: 0.3;
+            maximum: 3.0;
+            value: 1.0;
+            width: 200px;
+            y: 0px;
+        }
         ListView {
-            // TODO: spacing?
-            // TODO: zoom?
-            for image_source[i] in image_sources : Image {
-                source: image_source;
+            for image_source in image_sources : Rectangle {
+                // 1/3 for resolution
                 width: (image_source.width/3) * 1px;
+                height: (image_source.height/3) * 1px * 1.03; // 1.03 for spacing
                 x: max(0px, (parent.width - self.width) / 2);
+                Image {
+                    width: parent.width;
+                    source: image_source;
+                }
             }
         }
     }
