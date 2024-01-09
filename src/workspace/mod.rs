@@ -49,7 +49,7 @@ use crate::ext::InitializeParamsExt;
 
 use self::font_manager::FontManager;
 use self::fs::manager::FsManager;
-use self::fs::{FsResult, KnownUriProvider, ReadProvider, WriteProvider};
+use self::fs::{FsResult, KnownUriProvider, ReadProvider};
 use self::package::external::manager::ExternalPackageManager;
 use self::package::manager::PackageManager;
 use self::package::{FullFileId, Package};
@@ -115,20 +115,6 @@ impl Workspace {
 
     pub fn read_source(&self, uri: &Url) -> FsResult<Source> {
         self.fs.read_source(uri, &self.packages)
-    }
-
-    /// Write raw data to a file.
-    ///
-    /// This can cause cache invalidation errors if `uri` refers to a file in the cache, since the
-    /// cache wouldn't know about the update. However, this is hard to fix, because we don't have
-    /// `&mut self`.
-    ///
-    /// For example, when writing a PDF, we (effectively) have `&Workspace` after compiling via
-    /// Typst, and we'd rather not lock everything just to export the PDF. However, if we allow for
-    /// mutating files stored in the `Cache`, we could update a file while it is being used for a
-    /// Typst compilation, which is also bad.
-    pub fn write_raw(&self, uri: &Url, data: &[u8]) -> FsResult<()> {
-        self.fs.write_raw(uri, data)
     }
 
     pub fn known_uris(&self) -> HashSet<Url> {

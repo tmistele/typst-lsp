@@ -64,20 +64,6 @@ impl Project {
         self.workspace().read_source(uri)
     }
 
-    /// Write raw data to a file.
-    ///
-    /// This can cause cache invalidation errors if `uri` refers to a file in the cache, since the
-    /// cache wouldn't know about the update. However, this is hard to fix, because we don't have
-    /// `&mut self`.
-    ///
-    /// For example, when writing a PDF, we (effectively) have `&Workspace` after compiling via
-    /// Typst, and we'd rather not lock everything just to export the PDF. However, if we allow for
-    /// mutating files stored in the `Cache`, we could update a file while it is being used for a
-    /// Typst compilation, which is also bad.
-    pub fn write_raw(&self, uri: &Url, data: &[u8]) -> FsResult<()> {
-        self.workspace().write_raw(uri, data)
-    }
-
     pub async fn read_source_by_id(&self, id: FileId) -> FsResult<Source> {
         let full_id = self.fill_id(id);
         let uri = self.full_id_to_uri(full_id).await?;

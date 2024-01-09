@@ -34,9 +34,11 @@ pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
 pub mod typst_compiler;
+pub mod ui;
 pub mod watch;
 
 pub struct TypstServer {
+    ui: ui::Ui,
     client: Client,
     document: Mutex<Arc<Document>>,
     typst_thread: TypstThread,
@@ -52,8 +54,10 @@ impl TypstServer {
     pub fn new(
         client: Client,
         lsp_tracing_layer_handle: reload::Handle<Option<LspLayer>, Registry>,
+        ui: ui::Ui,
     ) -> Self {
         Self {
+            ui,
             typst_thread: Default::default(),
             workspace: Default::default(),
             config: Default::default(),

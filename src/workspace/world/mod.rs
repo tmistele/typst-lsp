@@ -1,7 +1,6 @@
 use comemo::Prehashed;
 use futures::Future;
 use tokio::runtime;
-use tower_lsp::lsp_types::Url;
 use typst::diag::{EcoString, FileResult};
 use typst::foundations::{Bytes, Datetime};
 use typst::syntax::package::PackageSpec;
@@ -9,7 +8,7 @@ use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
 use typst::{Library, World};
 
-use crate::workspace::fs::{FsError, FsResult};
+use crate::workspace::fs::FsError;
 use crate::workspace::project::Project;
 
 use self::clock::Now;
@@ -38,24 +37,6 @@ impl ProjectWorld {
             now: Now::new(),
             handle,
         }
-    }
-
-    pub fn now(&self) -> Option<Datetime> {
-        self.now.datetime()
-    }
-
-    /// Write raw data to a file.
-    ///
-    /// This can cause cache invalidation errors if `uri` refers to a file in the cache, since the
-    /// cache wouldn't know about the update. However, this is hard to fix, because we don't have
-    /// `&mut self`.
-    ///
-    /// For example, when writing a PDF, we (effectively) have `&Workspace` after compiling via
-    /// Typst, and we'd rather not lock everything just to export the PDF. However, if we allow for
-    /// mutating files stored in the `Cache`, we could update a file while it is being used for a
-    /// Typst compilation, which is also bad.
-    pub fn write_raw(&self, uri: &Url, data: &[u8]) -> FsResult<()> {
-        self.project.write_raw(uri, data)
     }
 
     /// Runs a `Future` in a non-async function, blocking until completion
