@@ -171,14 +171,27 @@ slint::slint! {
     import { ListView, Slider } from "std-widgets.slint";
     export component MainWindow inherits Window {
         in property <[image]> image_sources;
-        callback zoom_changed <=> zoom.changed;
-        zoom := Slider {
-            minimum: 0.3;
-            maximum: 3.0;
-            value: 1.0;
-            width: 200px;
-            y: 0px;
+
+        property<float> zoom: 1.0;
+        callback zoom_changed(float);
+
+        forward-focus: my-key-handler;
+        my-key-handler := FocusScope {
+            key-pressed(event) => {
+                if (event.modifiers.control) {
+                    if (event.text == "=") {
+                        zoom = min(zoom + 0.1, 3.0);
+                        zoom-changed(zoom);
+                    }
+                    if (event.text == "-") {
+                        zoom = max(zoom - 0.1, 0.3);
+                        zoom-changed(zoom);
+                    }
+                }
+                accept
+            }
         }
+
         ListView {
             for image_source in image_sources : Rectangle {
                 // 1/3 for resolution
