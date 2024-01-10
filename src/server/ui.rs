@@ -174,7 +174,7 @@ impl Ui {
 }
 
 slint::slint! {
-    import { ListView, Slider } from "std-widgets.slint";
+    import { ListView } from "std-widgets.slint";
     export component MainWindow inherits Window {
         in property <[image]> image_sources;
 
