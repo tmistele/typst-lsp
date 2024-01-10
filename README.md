@@ -1,3 +1,15 @@
+# Experiment: Slint-based live preview
+
+This branch contains an experimental proof-of-concept live preview which renders directly into a [slint](https://github.com/slint-ui/slint/) UI without a roundtrip through PNG or PDF.
+This is based on the `typst-render` crate which creates a `tiny_skia::Pixmap` which is rendered directly into a `slint::Image`.
+For additional performance, only the visible pages are rendered.
+
+The UI is opened automatically when `typst-lsp` is run and updates the preview whenever the original `typst-pdf` would generate a PDF (see the `exportPDF` setting).
+
+The UI is very basic. You can zoom using `Ctrl + =/-`.
+
+---
+
 # Typst LSP
 
 A language server for [Typst](https://typst.app/).
