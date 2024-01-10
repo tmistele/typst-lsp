@@ -95,7 +95,8 @@ reqwest = { version = "0.11.18", default-features = false, features = [
 ], optional = true }
 
 # fast live preview
-slint = "1.3.2"
+# TODO: temporary until this bug is fixed in a released version https://github.com/slint-ui/slint/issues/3125
+slint = { git = "https://github.com/slint-ui/slint", rev = "48180919da69ea1991902f58de85f6e08344c3f4" }
 tiny-skia = "0.11"
 
 [dev-dependencies]

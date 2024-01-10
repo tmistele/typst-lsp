@@ -158,6 +158,12 @@ impl Ui {
         main_window_weak
             .upgrade_in_event_loop(move |_main_window| {
                 IMAGES_MODEL.with(|model| model.set_doc(document));
+
+                // TODO: work around bug in slint?
+                // https://github.com/slint-ui/slint/issues/3125
+                // not sure. the bug fix mentioned there doesn't seem to fix it?
+                // only the workaround mentioned there:
+                _main_window.window().request_redraw();
             })
             .unwrap();
     }
