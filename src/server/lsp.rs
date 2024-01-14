@@ -257,7 +257,7 @@ impl LanguageServer for TypstServer {
 
         drop(workspace);
 
-        if let Err(err) = self.on_source_changed(&uri).await {
+        if let Err(err) = self.on_source_changed(&uri, None).await {
             error!(%err, %uri, "could not handle source change");
         };
     }
@@ -277,13 +277,15 @@ impl LanguageServer for TypstServer {
         let uri = params.text_document.uri;
         let changes = params.content_changes;
 
+        let first_change_range = changes.first().map(|event| event.range).flatten();
+
         let mut workspace = self.workspace().write().await;
 
         workspace.edit_lsp(&uri, changes, self.const_config().position_encoding);
 
         drop(workspace);
 
-        if let Err(err) = self.on_source_changed(&uri).await {
+        if let Err(err) = self.on_source_changed(&uri, first_change_range).await {
             error!(%err, %uri, "could not handle source change");
         };
     }
@@ -303,7 +305,7 @@ impl LanguageServer for TypstServer {
             return;
         };
 
-        if let Err(err) = self.run_diagnostics_and_export(&uri).await {
+        if let Err(err) = self.run_diagnostics_and_export(&uri, None).await {
             error!(%err, %uri, "could not handle source save");
         };
     }

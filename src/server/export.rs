@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{Range, Url};
 use tracing::info;
 use typst::foundations::Smart;
 use typst::model::Document;
@@ -13,11 +13,20 @@ impl TypstServer {
         &self,
         source_uri: &Url,
         document: Arc<Document>,
+        first_change_range: Option<Range>,
     ) -> anyhow::Result<()> {
         info!("updating UI");
 
-        self.ui.show_document(document).await;
-        info!("finished updating UI.");
+        // NB: Cloning/reading a `Source` is cheap.
+        let source = self
+            .scope_with_source(source_uri)
+            .await
+            .expect("No source file?")
+            .source;
+
+        self.ui
+            .show_document(document, source, first_change_range)
+            .await;
 
         Ok(())
     }
