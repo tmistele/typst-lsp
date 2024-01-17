@@ -140,21 +140,25 @@ impl LazyImagesModel {
 
             // Scroll to found position
             if let Some((page_index, page_size, ypos)) = scroll_target {
-                // position within page
                 let zoom = self.zoom.borrow().clone();
-                let ypos = (ypos.to_pt() as f32) * zoom;
 
-                // add page offset
-                // TODO: this assumes all pages have same height.
-                let ypos = ypos + (page_index as f32) * page_size * zoom * 1.03;
-
-                tracing::error!("scrolling to {:?} on page {:?}", ypos, page_index);
                 // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
                 //       Seems to happen only when scrolling to a different page.
                 //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
                 //       Maybe: It's just the slint "fail to redraw" bug again in some form?
                 self.main_window_weak
                     .upgrade_in_event_loop(move |main_window| {
+                        // Take into account zoom
+                        // Take into account the factor (1.6666666 * 1phx/1px)
+                        let image_scale = zoom * (1.6666666 / main_window.window().scale_factor());
+
+                        // add page offset, take into account zoom
+                        // TODO: this assumes all pages have same height.
+                        let ypos = (ypos.to_pt() as f32) * image_scale
+                            + 5.0
+                            + (page_index as f32) * (page_size * image_scale + 10.0);
+
+                        tracing::error!("scrolling to {:?} on page {:?}", ypos, page_index);
                         let current_ypos = main_window.get_list_viewport_y().abs();
                         let current_visible_height = main_window.get_list_visible_height();
 
@@ -369,8 +373,8 @@ slint::slint! {
             // TODO: Handle link clicks
             for image_source in image_sources : Rectangle {
                 // 1/3 for resolution
-                width: (image_source.width/3) * 1px;
-                height: (image_source.height/3) * 1px * 1.03; // 1.03 for spacing
+                width: (image_source.width/3) * 1px * (1.6666666 * 1phx/1px);
+                height: (image_source.height/3) * 1px * (1.6666666 * 1phx/1px) + 10px; // +10px for spacing
                 x: max(0px, (parent.width - self.width) / 2);
                 Image {
                     width: parent.width;
