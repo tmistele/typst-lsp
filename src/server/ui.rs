@@ -194,7 +194,7 @@ impl LazyImagesModel {
                     let total_range = (first_range.start)..(last_range.end);
 
                     if Self::overlap(range, &total_range) {
-                        return Some(point.y);
+                        return Some(point.y - text_item.size);
                     }
                 }
                 typst::layout::FrameItem::Meta(meta, size) => {
