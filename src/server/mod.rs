@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use once_cell::sync::OnceCell;
 use tokio::runtime;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, RwLockReadGuard};
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{ShowDocumentParams, Url};
 use tower_lsp::Client;
 use tracing_subscriber::{reload, Registry};
 use typst::model::Document;
@@ -39,6 +40,7 @@ pub mod watch;
 
 pub struct TypstServer {
     ui: ui::Ui,
+    show_document_receiver: Arc<Mutex<Receiver<ShowDocumentParams>>>,
     client: Client,
     document: Mutex<Arc<Document>>,
     typst_thread: TypstThread,
@@ -54,10 +56,12 @@ impl TypstServer {
     pub fn new(
         client: Client,
         lsp_tracing_layer_handle: reload::Handle<Option<LspLayer>, Registry>,
-        ui: ui::Ui,
     ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
         Self {
-            ui,
+            ui: ui::Ui::init(tx),
+            show_document_receiver: Arc::new(Mutex::new(rx)),
             typst_thread: Default::default(),
             workspace: Default::default(),
             config: Default::default(),

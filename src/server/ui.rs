@@ -2,8 +2,8 @@ use slint::{Model, ModelNotify, ModelTracker};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::thread;
-use tower_lsp::lsp_types::Range;
-use tracing::debug;
+use tokio::sync::mpsc::Sender;
+use tower_lsp::lsp_types::{Position, Range, ShowDocumentParams, Url};
 use typst::model::Document;
 
 // TODO: why do we panic when closing the window??
@@ -17,6 +17,8 @@ pub struct LazyImagesModel {
     document: RefCell<Option<Arc<Document>>>,
     frame_hashes: RefCell<Vec<u128>>,
     source: RefCell<Option<typst::syntax::Source>>,
+    source_uri: RefCell<Option<Url>>,
+    show_document_sender: RefCell<Option<Sender<ShowDocumentParams>>>,
     notify: ModelNotify,
     zoom: RefCell<f32>,
     main_window_weak: slint::Weak<MainWindow>,
@@ -29,10 +31,16 @@ impl LazyImagesModel {
             document: RefCell::new(None),
             frame_hashes: RefCell::new(Vec::new()),
             source: RefCell::new(None),
+            source_uri: RefCell::new(None),
+            show_document_sender: RefCell::new(None),
             notify: Default::default(),
             zoom: RefCell::new(1.0),
             main_window_weak,
         }
+    }
+
+    pub fn set_show_document_sender(&self, show_document_sender: Sender<ShowDocumentParams>) {
+        *self.show_document_sender.borrow_mut() = Some(show_document_sender);
     }
 
     fn slint_workaround_redraw(&self) {
@@ -51,6 +59,7 @@ impl LazyImagesModel {
         &self,
         new_doc: Arc<Document>,
         new_source: typst::syntax::Source,
+        new_source_uri: Url,
         first_change_range: Option<Range>,
     ) {
         let new_len = new_doc.pages.len();
@@ -64,6 +73,7 @@ impl LazyImagesModel {
         );
         let old_document = self.document.replace(Some(new_doc));
         let old_source = self.source.replace(Some(new_source));
+        *self.source_uri.borrow_mut() = Some(new_source_uri);
         *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(new_len).collect();
         self.notify.reset();
 
@@ -231,6 +241,157 @@ impl LazyImagesModel {
         None
     }
 
+    fn find_source_range_from_xypos(
+        frame: &typst::layout::Frame,
+        x: f32,
+        y: f32,
+        source: &typst::syntax::Source,
+    ) -> Option<std::ops::Range<usize>> {
+        let zero_point = typst::layout::Point::zero();
+        for (point, frame_item) in frame.items() {
+            match frame_item {
+                typst::layout::FrameItem::Text(text_item) => {
+                    let mut dx = 0.0;
+                    for glyph in text_item.glyphs.iter() {
+                        let glyph_width = (glyph.x_advance + glyph.x_offset).at(text_item.size);
+                        let glyph_height = text_item.size;
+
+                        if x > dx + point.x.to_pt() as f32
+                            && x < dx + (point.x + glyph_width).to_pt() as f32
+                            && y > (point.y - glyph_height).to_pt() as f32
+                            && y < point.y.to_pt() as f32
+                        {
+                            if let Some(range) = source.range(glyph.span.0) {
+                                return Some(range);
+                            }
+                            // Some glyphs don't have a range. For example text in backticks?
+                            break;
+                        }
+
+                        dx += glyph_width.to_pt() as f32;
+                    }
+                }
+                typst::layout::FrameItem::Meta(meta, size) => {
+                    if size.to_point() == zero_point {
+                        continue;
+                    }
+                    let typst::introspection::Meta::Elem(content) = meta else {
+                        continue;
+                    };
+
+                    let span = content.span();
+                    let Some(range_in_source_file) = source.range(span) else {
+                        continue;
+                    };
+
+                    if x > point.x.to_pt() as f32
+                        && x < (point.x + size.x).to_pt() as f32
+                        && y > point.y.to_pt() as f32
+                        && y < (point.y + size.y).to_pt() as f32
+                    {
+                        return Some(range_in_source_file);
+                    }
+                }
+                typst::layout::FrameItem::Group(group_item) => {
+                    if let Some(range) = Self::find_source_range_from_xypos(
+                        &group_item.frame,
+                        x - point.x.to_pt() as f32,
+                        y - point.y.to_pt() as f32,
+                        &source,
+                    ) {
+                        return Some(range);
+                    }
+                }
+                _ => {}
+            };
+        }
+        None
+    }
+    pub fn show_document_from_xy_click(
+        &self,
+        x: f32,
+        y: f32,
+        image_scale: f32,
+        viewport_visible_width: f32,
+    ) {
+        // Find the page from which the click came.
+
+        let document = self.document.borrow();
+        let document = document.as_ref().unwrap();
+
+        let (page, x, y) = {
+            let mut relative_y = y;
+            let mut relative_x = x;
+            let mut found_page = None;
+            let mut ypos = 5.0;
+            for page in document.pages.iter() {
+                relative_y = y - ypos;
+                ypos += (page.height().to_pt() as f32) * image_scale;
+                tracing::error!(
+                    "checking -> checking if in page ending at {} (rel y = {})",
+                    ypos,
+                    relative_y
+                );
+                if ypos > y {
+                    let page_width = (page.width().to_pt() as f32) * image_scale;
+                    let page_x = (viewport_visible_width - page_width) / 2.0;
+                    let page_x = page_x.max(0.0);
+                    relative_x = x - page_x;
+                    found_page = Some(page);
+                    break;
+                }
+                ypos += 10.0;
+            }
+            let Some(found_page) = found_page else {
+                return;
+            };
+            (found_page, relative_x, relative_y)
+        };
+        tracing::error!("-> relative y = {}, x = {}", y, x);
+
+        let source = self.source.borrow();
+        let source = source.as_ref().unwrap();
+
+        let Some(typst_range) =
+            Self::find_source_range_from_xypos(page, x / image_scale, y / image_scale, &source)
+        else {
+            tracing::error!("-> found no match :()");
+            return;
+        };
+
+        // Jump to the found source location in the editor
+        let params = ShowDocumentParams {
+            uri: self.source_uri.borrow().as_ref().unwrap().clone(),
+            external: Some(false),
+            take_focus: Some(true),
+            selection: Some(Range {
+                // TODO: does this work with non-ascii?
+                start: Position {
+                    line: source
+                        .byte_to_line(typst_range.start)
+                        .expect("couldn't map start line") as u32,
+                    character: source
+                        .byte_to_column(typst_range.start)
+                        .expect("couldn't map start column") as u32,
+                },
+                end: Position {
+                    line: source
+                        .byte_to_line(typst_range.end)
+                        .expect("couldn't map end line") as u32,
+                    character: source
+                        .byte_to_column(typst_range.end)
+                        .expect("couldn't map end column") as u32,
+                },
+            }),
+        };
+        self.show_document_sender
+            .borrow()
+            .as_ref()
+            .expect("Don't have a show documentsender?")
+            .blocking_send(params)
+            .expect("Could not send show document?");
+    }
+
     pub fn set_zoom(&self, zoom: f32) {
         *self.zoom.borrow_mut() = zoom.abs().max(0.3).min(3.0);
         let len = self.images.borrow().len();
@@ -306,11 +467,10 @@ thread_local!(static IMAGES_MODEL: std::rc::Rc<LazyImagesModel> = MAIN_WINDOW.wi
 pub struct Ui {}
 
 impl Ui {
-    pub async fn init() -> Self {
-        debug!("I am creating a new thread.");
-
+    pub fn init(show_document_sender: Sender<ShowDocumentParams>) -> Self {
         // The UI / slint event loop thread
         thread::spawn(|| {
+            IMAGES_MODEL.with(|model| model.set_show_document_sender(show_document_sender));
             MAIN_WINDOW.with(|main_window| {
                 IMAGES_MODEL.with(|model| {
                     main_window.set_image_sources(slint::ModelRc::new(model.clone()))
@@ -319,7 +479,20 @@ impl Ui {
                 main_window.on_zoom_changed(|zoom| {
                     IMAGES_MODEL.with(|model| {
                         model.set_zoom(zoom);
-                    })
+                    });
+                });
+
+                main_window.on_clicked(|x, y, image_scale, viewport_visible_width| {
+                    tracing::error!(
+                        "click {} {} (scale = {}, viewport width = {})",
+                        x,
+                        y,
+                        image_scale,
+                        viewport_visible_width
+                    );
+                    IMAGES_MODEL.with(|model| {
+                        model.show_document_from_xy_click(x, y, image_scale, viewport_visible_width)
+                    });
                 });
 
                 main_window.run().unwrap();
@@ -333,10 +506,15 @@ impl Ui {
         &self,
         document: Arc<Document>,
         source: typst::syntax::Source,
+        source_uri: &Url,
         first_change_range: Option<Range>,
     ) {
+        let source_uri = source_uri.clone();
         slint::invoke_from_event_loop(move || {
-            IMAGES_MODEL.with(|model| model.set_doc(document, source, first_change_range))
+            IMAGES_MODEL.with(|model| {
+                // TODO: Can we avoid the source_uri clone?
+                model.set_doc(document, source, source_uri, first_change_range)
+            })
         })
         .unwrap();
     }
@@ -366,6 +544,21 @@ slint::slint! {
                     }
                 }
                 accept
+            }
+        }
+
+        callback clicked(float, float, float, float);
+        my-touch-area := TouchArea {
+            width: mylist.width;
+            height: mylist.height;
+            clicked => {
+                clicked(
+                    // note: viewport offset is negative
+                    (- mylist.viewport-x + my-touch-area.pressed-x) / 1px,
+                    (- mylist.viewport-y + my-touch-area.pressed-y) / 1px,
+                    (1.6666666 * 1phx/1px)*zoom,
+                    mylist.visible-width / 1px,
+               );
             }
         }
 

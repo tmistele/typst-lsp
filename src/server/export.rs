@@ -25,7 +25,7 @@ impl TypstServer {
             .source;
 
         self.ui
-            .show_document(document, source, first_change_range)
+            .show_document(document, source, source_uri, first_change_range)
             .await;
 
         Ok(())

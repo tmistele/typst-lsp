@@ -69,6 +69,21 @@ impl LanguageServer for TypstServer {
             _ => None,
         };
 
+        {
+            // Respond to requests from the UI to jump to a location in the editor.
+            let rx = Arc::clone(&self.show_document_receiver);
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let mut rx = rx.lock().await;
+                while let Some(params) = rx.recv().await {
+                    client
+                        .show_document(params)
+                        .await
+                        .expect("Could not show document?");
+                }
+            });
+        }
+
         let document_formatting_provider = match config.formatter {
             ExperimentalFormatterMode::On
                 if !params.supports_document_formatting_dynamic_registration() =>

@@ -31,10 +31,8 @@ async fn run(lsp_tracing_layer_handle: reload::Handle<Option<LspLayer>, Registry
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let ui = server::ui::Ui::init().await;
-
     let (service, socket) =
-        LspService::new(move |client| TypstServer::new(client, lsp_tracing_layer_handle, ui));
+        LspService::new(move |client| TypstServer::new(client, lsp_tracing_layer_handle));
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }
