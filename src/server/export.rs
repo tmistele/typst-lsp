@@ -5,6 +5,7 @@ use tracing::info;
 use typst::foundations::Smart;
 use typst::model::Document;
 
+use super::ui;
 use super::TypstServer;
 
 impl TypstServer {
@@ -17,16 +18,13 @@ impl TypstServer {
     ) -> anyhow::Result<()> {
         info!("updating UI");
 
-        // NB: Cloning/reading a `Source` is cheap.
-        let source = self
-            .scope_with_source(source_uri)
-            .await
-            .expect("No source file?")
-            .source;
-
-        self.ui
-            .show_document(document, source, source_uri, first_change_range)
-            .await;
+        self.to_ui_tx
+            .send(ui::NewDocumentMessage {
+                document,
+                source_uri: source_uri.clone(),
+                first_change_range,
+            })
+            .await?;
 
         Ok(())
     }

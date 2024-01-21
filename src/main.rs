@@ -2,8 +2,8 @@
 
 use bpaf::{construct, OptionParser, Parser};
 use logging::{tracing_init, tracing_shutdown};
-use server::log::LspLayer;
 use server::TypstServer;
+use server::{log::LspLayer, ui::Ui};
 use tower_lsp::{LspService, Server};
 use tracing_subscriber::{reload, Registry};
 
@@ -31,10 +31,30 @@ async fn run(lsp_tracing_layer_handle: reload::Handle<Option<LspLayer>, Registry
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) =
-        LspService::new(move |client| TypstServer::new(client, lsp_tracing_layer_handle));
+    let (to_ui_tx, to_ui_rx) = tokio::sync::mpsc::channel(10);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    let workspace: std::sync::Arc<
+        once_cell::sync::OnceCell<std::sync::Arc<tokio::sync::RwLock<workspace::Workspace>>>,
+    > = Default::default();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    let workspace_for_server = std::sync::Arc::clone(&workspace);
+    let (service, socket) = LspService::new(move |client| {
+        tx.send(client.clone()).unwrap();
+        TypstServer::new(
+            client,
+            lsp_tracing_layer_handle,
+            to_ui_tx,
+            workspace_for_server,
+        )
+    });
+
+    let server_fut = Server::new(stdin, stdout, socket).serve(service);
+    let ui = Ui::new(workspace, rx.await.unwrap());
+    let ui_fut = ui.run(to_ui_rx);
+
+    futures::join!(server_fut, ui_fut);
 }
 
 #[derive(Debug, Clone)]

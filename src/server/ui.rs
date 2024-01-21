@@ -1,10 +1,22 @@
+use once_cell::sync::OnceCell;
 use slint::{Model, ModelNotify, ModelTracker};
-use std::cell::RefCell;
+use std::sync::mpsc::Receiver as StdReceiver;
+use std::sync::mpsc::Sender as StdSender;
 use std::sync::Arc;
 use std::thread;
-use tokio::sync::mpsc::Sender;
+use std::{cell::RefCell, sync::Mutex};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{Position, Range, ShowDocumentParams, Url};
+use tower_lsp::Client;
 use typst::model::Document;
+use typst_ide::Jump;
+
+use crate::server::WorldThread;
+use crate::workspace::project::Project;
+use crate::workspace::world::typst_thread::TypstThread;
+use crate::workspace::Workspace;
 
 // TODO: why do we panic when closing the window??
 //       -> If I comment out the tracing_subscriber::registery().init() thing the crash goes away
@@ -14,33 +26,30 @@ use typst::model::Document;
 // The usefulness of this comes from slint's `ListView` only instantiating elements that are visible.
 pub struct LazyImagesModel {
     images: RefCell<Vec<Option<slint::Image>>>,
-    document: RefCell<Option<Arc<Document>>>,
-    frame_hashes: RefCell<Vec<u128>>,
-    source: RefCell<Option<typst::syntax::Source>>,
-    source_uri: RefCell<Option<Url>>,
-    show_document_sender: RefCell<Option<Sender<ShowDocumentParams>>>,
     notify: ModelNotify,
-    zoom: RefCell<f32>,
     main_window_weak: slint::Weak<MainWindow>,
+    ui_request_tx: RefCell<Option<Sender<UiRequest>>>,
+    pixelbuffer_rx: RefCell<Option<StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>>>,
 }
 
 impl LazyImagesModel {
     pub fn new(main_window_weak: slint::Weak<MainWindow>) -> Self {
         LazyImagesModel {
             images: RefCell::new(Vec::new()),
-            document: RefCell::new(None),
-            frame_hashes: RefCell::new(Vec::new()),
-            source: RefCell::new(None),
-            source_uri: RefCell::new(None),
-            show_document_sender: RefCell::new(None),
             notify: Default::default(),
-            zoom: RefCell::new(1.0),
             main_window_weak,
+            ui_request_tx: RefCell::new(None),
+            pixelbuffer_rx: RefCell::new(None),
         }
     }
 
-    pub fn set_show_document_sender(&self, show_document_sender: Sender<ShowDocumentParams>) {
-        *self.show_document_sender.borrow_mut() = Some(show_document_sender);
+    pub fn set_rxtx(
+        &self,
+        ui_request_tx: Sender<UiRequest>,
+        pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
+    ) {
+        *self.ui_request_tx.borrow_mut() = Some(ui_request_tx);
+        *self.pixelbuffer_rx.borrow_mut() = Some(pixelbuffer_rx);
     }
 
     fn slint_workaround_redraw(&self) {
@@ -55,37 +64,360 @@ impl LazyImagesModel {
             .unwrap();
     }
 
-    pub fn set_doc(
+    pub fn reset_all(&self, new_len: usize) {
+        *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(new_len).collect();
+        self.notify.reset();
+
+        self.slint_workaround_redraw();
+    }
+}
+
+impl Model for LazyImagesModel {
+    type Data = slint::Image;
+
+    fn row_count(&self) -> usize {
+        self.images.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        tracing::error!("getting page {} of doc", row);
+
+        let data = self
+            .images
+            .borrow_mut()
+            .get_mut(row)?
+            .get_or_insert_with(|| {
+                let tx = self.ui_request_tx.borrow();
+                let tx = tx.as_ref().unwrap();
+                tx.blocking_send(UiRequest::Render(row))
+                    .expect("requesting render failed");
+
+                let rx = self.pixelbuffer_rx.borrow();
+                let rx = rx.as_ref().unwrap();
+
+                let pixel_buffer = rx.recv().expect("receiving pixbuf failed");
+                slint::Image::from_rgba8_premultiplied(pixel_buffer)
+            })
+            .clone();
+
+        Some(data)
+    }
+
+    fn set_row_data(&self, row: usize, data: Self::Data) {
+        if row < self.row_count() {
+            self.images.borrow_mut()[row] = Some(data);
+            self.notify.row_changed(row);
+        }
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+thread_local!(static MAIN_WINDOW: MainWindow = MainWindow::new().unwrap());
+
+thread_local!(static IMAGES_MODEL: std::rc::Rc<LazyImagesModel> = MAIN_WINDOW.with(|main_window| {
+        std::rc::Rc::new(LazyImagesModel::new(main_window.as_weak()))
+    })
+);
+
+pub struct Ui {
+    document: Mutex<Arc<Document>>,
+    frame_hashes: Mutex<Vec<u128>>,
+    source_uri: Mutex<Option<Url>>,
+    zoom: Mutex<f32>,
+    workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>,
+    // TODO: Share a typst thread with the `TypstServer`? Like we share a `Workspace`?
+    typst_thread: TypstThread,
+    client: Client,
+}
+
+pub struct NewDocumentMessage {
+    pub document: Arc<Document>,
+    pub source_uri: Url,
+    pub first_change_range: Option<Range>,
+}
+
+pub enum UiRequest {
+    Render(usize),
+    JumpFromClick(f32, f32, f32, f32),
+    Zoom(f32),
+}
+
+impl Ui {
+    pub fn new(workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>, client: Client) -> Self {
+        Self {
+            document: Default::default(),
+            frame_hashes: Default::default(),
+            source_uri: Default::default(),
+            zoom: Mutex::new(1.0),
+            typst_thread: Default::default(),
+            workspace,
+            client,
+        }
+    }
+
+    fn workspace(&self) -> &Arc<RwLock<Workspace>> {
+        self.workspace
+            .get()
+            .expect("workspace should be initialized")
+    }
+
+    async fn thread_with_world(&self) -> WorldThread {
+        let (main, main_project) = {
+            let uri = self.source_uri.lock().unwrap();
+            let uri = uri.as_ref().expect("Do not have a source uri");
+            let workspace = Arc::clone(self.workspace()).read_owned().await;
+            let full_id = workspace.full_id(&uri).unwrap();
+            let source = workspace.read_source(&uri).unwrap();
+            let project = Project::new(full_id.package(), workspace);
+            (source, project)
+        };
+
+        WorldThread {
+            main,
+            main_project,
+            typst_thread: &self.typst_thread,
+        }
+    }
+
+    pub async fn run(&self, mut to_ui_rx: Receiver<NewDocumentMessage>) {
+        let (ui_request_tx, mut ui_request_rx) = channel(10);
+        let (pixelbuffer_tx, pixelbuffer_rx) = std::sync::mpsc::channel();
+
+        // The UI / slint event loop thread
+        let jump_click_tx = ui_request_tx.clone();
+        let zoom_tx = ui_request_tx.clone();
+        thread::spawn(|| {
+            IMAGES_MODEL.with(|model| model.set_rxtx(ui_request_tx, pixelbuffer_rx));
+            MAIN_WINDOW.with(|main_window| {
+                IMAGES_MODEL.with(|model| {
+                    main_window.set_image_sources(slint::ModelRc::new(model.clone()))
+                });
+
+                main_window.on_zoom_changed(move |zoom| {
+                    zoom_tx
+                        .blocking_send(UiRequest::Zoom(zoom))
+                        .expect("could not send zoom request");
+                });
+
+                main_window.on_clicked(move |x, y, image_scale, viewport_visible_width| {
+                    jump_click_tx
+                        .blocking_send(UiRequest::JumpFromClick(
+                            x,
+                            y,
+                            image_scale,
+                            viewport_visible_width,
+                        ))
+                        .expect("could not send jump click request");
+                });
+
+                main_window.run().unwrap();
+            });
+        });
+
+        // Wait for documents to come in from LSP
+        let fut1 = async {
+            while let Some(msg) = to_ui_rx.recv().await {
+                tracing::error!("ok, got document!");
+                self.show_document(msg.document, msg.source_uri, msg.first_change_range)
+                    .await;
+            }
+        };
+        // Wait for render requests to come in from slint UI
+        let fut2 = async {
+            while let Some(ui_request) = ui_request_rx.recv().await {
+                match ui_request {
+                    UiRequest::Render(page_index) => {
+                        tracing::error!("got render request for pgae {}", page_index);
+                        self.render_page(page_index, &pixelbuffer_tx).await;
+                    }
+                    UiRequest::JumpFromClick(x, y, image_scale, viewport_visible_width) => {
+                        tracing::error!(
+                            "got ui click! {} {} {} {}",
+                            x,
+                            y,
+                            image_scale,
+                            viewport_visible_width
+                        );
+                        self.jump_from_click(x, y, image_scale, viewport_visible_width)
+                            .await;
+                    }
+                    UiRequest::Zoom(zoom) => {
+                        tracing::error!("got zoom request {}", zoom);
+                        *self.zoom.lock().unwrap() = zoom.abs().max(0.3).min(3.0);
+                        let number_pages = self.document.lock().unwrap().pages.len();
+
+                        slint::invoke_from_event_loop(move || {
+                            IMAGES_MODEL.with(move |model| model.reset_all(number_pages))
+                        })
+                        .unwrap();
+                    }
+                }
+            }
+        };
+        futures::join!(fut1, fut2);
+    }
+
+    async fn jump_from_click(&self, x: f32, y: f32, image_scale: f32, viewport_visible_width: f32) {
+        // Find the page from which the click came.
+        let document = self.document.lock().unwrap();
+        let document = document.to_owned();
+
+        let (page_index, x, y) = {
+            let mut relative_y = y;
+            let mut relative_x = x;
+            let mut found_page_index = None;
+            let mut ypos = 5.0;
+            for (page_index, page) in document.pages.iter().enumerate() {
+                relative_y = y - ypos;
+                ypos += (page.height().to_pt() as f32) * image_scale;
+                tracing::error!(
+                    "checking -> checking if in page ending at {} (rel y = {})",
+                    ypos,
+                    relative_y
+                );
+                if ypos > y {
+                    let page_width = (page.width().to_pt() as f32) * image_scale;
+                    let page_x = (viewport_visible_width - page_width) / 2.0;
+                    let page_x = page_x.max(0.0);
+                    relative_x = x - page_x;
+                    found_page_index = Some(page_index);
+                    break;
+                }
+                ypos += 10.0;
+            }
+            let Some(found_page_index) = found_page_index else {
+                return;
+            };
+            (found_page_index, relative_x, relative_y)
+        };
+        tracing::error!("-> relative y = {}, x = {}", y, x);
+
+        // Find jump location from position in that page
+        let (tx, rx) = oneshot::channel();
+        self.thread_with_world()
+            .await
+            .run(move |world| {
+                // `image_scale` takes into account zoom level etc.
+                let point = typst::layout::Point {
+                    x: typst::layout::Abs::pt((x / image_scale).into()),
+                    y: typst::layout::Abs::pt((y / image_scale).into()),
+                };
+                let jump = typst_ide::jump_from_click(
+                    &world,
+                    &document,
+                    &document.pages[page_index],
+                    point,
+                );
+                tx.send(jump).expect("couldn't send jump");
+            })
+            .await;
+
+        let jump = rx.await.expect("couldn't recv jump");
+        tracing::error!("-> got jump {:?}", jump);
+
+        let Some(jump) = jump else {
+            return;
+        };
+
+        // Do the jump
+        let params = match jump {
+            Jump::Source(file_id, position) => {
+                let (uri, source) = {
+                    let main_uri = self.source_uri.lock().unwrap();
+                    let main_uri = main_uri.as_ref().expect("Do not have a source uri");
+                    let workspace = Arc::clone(self.workspace()).read_owned().await;
+                    let full_id = workspace.full_id(&main_uri).unwrap();
+                    let package = workspace
+                        .package_manager()
+                        .package(full_id.package())
+                        .await
+                        .expect("package not found?");
+                    let uri = package.vpath_to_uri(file_id.vpath()).unwrap();
+                    let source = workspace.read_source(&uri).unwrap();
+
+                    (uri, source)
+                };
+
+                let position = Position {
+                    line: source
+                        .byte_to_line(position)
+                        .expect("couldn't map start line") as u32,
+                    character: source
+                        .byte_to_column(position)
+                        .expect("couldn't map start column") as u32,
+                };
+
+                tracing::error!("-> jump Source =  {:?}", uri);
+
+                ShowDocumentParams {
+                    uri,
+                    external: Some(false),
+                    take_focus: Some(true),
+                    // TODO: does this work with non-ascii?
+                    selection: Some(Range {
+                        start: position,
+                        end: position,
+                    }),
+                }
+            }
+            _ => {
+                // TODO: Handle links
+                todo!();
+            }
+        };
+
+        self.client
+            .show_document(params)
+            .await
+            .expect("could not show document?");
+    }
+
+    async fn show_document(
         &self,
         new_doc: Arc<Document>,
-        new_source: typst::syntax::Source,
         new_source_uri: Url,
         first_change_range: Option<Range>,
     ) {
         let new_len = new_doc.pages.len();
 
-        let old_hashes = self.frame_hashes.replace(
-            new_doc
-                .pages
-                .iter()
-                .map(|frame| typst::util::hash128(frame))
-                .collect(),
-        );
-        let old_document = self.document.replace(Some(new_doc));
-        let old_source = self.source.replace(Some(new_source));
-        *self.source_uri.borrow_mut() = Some(new_source_uri);
-        *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(new_len).collect();
-        self.notify.reset();
+        let old_hashes = {
+            let mut frame_hashes = self.frame_hashes.lock().unwrap();
+            std::mem::replace(
+                &mut *frame_hashes,
+                new_doc
+                    .pages
+                    .iter()
+                    .map(|frame| typst::util::hash128(frame))
+                    .collect(),
+            )
+        };
+        *self.document.lock().unwrap() = new_doc;
+        *self.source_uri.lock().unwrap() = Some(new_source_uri);
 
-        self.slint_workaround_redraw();
+        slint::invoke_from_event_loop(move || {
+            IMAGES_MODEL.with(move |model| model.reset_all(new_len))
+        })
+        .unwrap();
 
         // Find first change and scroll to it
+        // TODO: Maybe use  `typst_ide::jump_from_cursor`
         if let Some(range) = first_change_range {
-            let document = self.document.borrow();
-            let document = document.as_ref().unwrap();
+            // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
+            let document = self.document.lock().unwrap().to_owned();
 
-            let source = self.source.borrow();
-            let source = source.as_ref().unwrap();
+            let source = {
+                let main_uri = self.source_uri.lock().unwrap();
+                let main_uri = main_uri.as_ref().expect("Do not have a source uri");
+                let workspace = Arc::clone(self.workspace()).read_owned().await;
+                workspace.read_source(&main_uri).unwrap()
+            };
 
             // Convert lsp range (line + character) to byte range
             // TODO: Does that work with non-ascii?
@@ -99,7 +431,7 @@ impl LazyImagesModel {
             };
             tracing::error!("Searching for position of range = {:?}", range);
 
-            let new_hashes = self.frame_hashes.borrow();
+            let new_hashes = self.frame_hashes.lock().unwrap();
 
             let mut scroll_target = None;
 
@@ -113,51 +445,31 @@ impl LazyImagesModel {
 
                 tracing::error!("-> searching in page {}", page_index);
 
-                if let Some(ypos) = Self::find_ypos_from_source_range(page, &range, source) {
+                if let Some(ypos) = Self::find_ypos_from_source_range(page, &range, &source) {
                     let page_size = page.size().to_point().y.to_pt() as f32;
                     scroll_target = Some((page_index, page_size, ypos));
                     break;
                 }
             }
 
-            // If, for example, a line is deleted, the `range` may not be found in the
-            // new document. But it will be in the old document. So look there for a
-            // position to scroll to (the position where now something is missing).
-            // TODO: deduplicate code
-            if scroll_target.is_none() && old_document.is_some() && old_source.is_some() {
-                let old_document = old_document.unwrap();
-                for (page_index, page) in old_document.pages.iter().enumerate() {
-                    // Avoid searching through all pages by checking the hashes.
-                    if page_index < new_hashes.len()
-                        && new_hashes[page_index] == old_hashes[page_index]
-                    {
-                        continue;
-                    }
-
-                    tracing::error!("-> searching IN OLD page {}", page_index);
-
-                    if let Some(ypos) = Self::find_ypos_from_source_range(
-                        page,
-                        &range,
-                        old_source.as_ref().unwrap(),
-                    ) {
-                        let page_size = page.size().to_point().y.to_pt() as f32;
-                        scroll_target = Some((page_index, page_size, ypos));
-                        break;
-                    }
-                }
-            }
+            // TODO: In a previous version I had a search here in the old document and the old source.
+            //       Use case: Delete a paragraph. This happens in a range that one can't find in the new source!
+            //
+            //       I left it out now for simplicity and because the official web app also doesn't seem to support this.
+            //
+            //       Put it back in?
 
             // Scroll to found position
             if let Some((page_index, page_size, ypos)) = scroll_target {
-                let zoom = self.zoom.borrow().clone();
+                let zoom = self.zoom.lock().unwrap().clone();
 
                 // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
                 //       Seems to happen only when scrolling to a different page.
                 //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
                 //       Maybe: It's just the slint "fail to redraw" bug again in some form?
-                self.main_window_weak
-                    .upgrade_in_event_loop(move |main_window| {
+
+                slint::invoke_from_event_loop(move || {
+                    MAIN_WINDOW.with(move |main_window| {
                         // Take into account zoom
                         // Take into account the factor (1.6666666 * 1phx/1px)
                         let image_scale = zoom * (1.6666666 / main_window.window().scale_factor());
@@ -179,14 +491,40 @@ impl LazyImagesModel {
                             let ypos = ypos - current_visible_height * 0.3;
                             main_window.set_list_viewport_y(-ypos);
                         }
-                    })
-                    .unwrap();
+                    });
+                })
+                .unwrap();
             }
         }
     }
 
-    fn overlap(r1: &std::ops::Range<usize>, r2: &std::ops::Range<usize>) -> bool {
-        (r1.start <= r2.end) && (r2.start <= r1.end)
+    async fn render_page(
+        &self,
+        page_index: usize,
+        pixelbuffer_tx: &StdSender<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
+    ) {
+        tracing::error!("-> rendering page {} of doc", page_index);
+
+        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
+        let document = self.document.lock().unwrap().to_owned();
+        let page = document.pages.get(page_index).unwrap();
+
+        let zoom = self.zoom.lock().unwrap().clone();
+
+        tracing::error!("-> starting typst_render");
+        let pixmap = typst_render::render(page, zoom * 3.0, typst::visualize::Color::WHITE);
+        tracing::error!("-> ... done");
+        let width = pixmap.width();
+        let height = pixmap.height();
+        let pixel_buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            &pixmap.take(),
+            width,
+            height,
+        );
+
+        pixelbuffer_tx
+            .send(pixel_buffer)
+            .expect("sending pixbuf failed");
     }
 
     fn find_ypos_from_source_range(
@@ -241,282 +579,8 @@ impl LazyImagesModel {
         None
     }
 
-    fn find_source_range_from_xypos(
-        frame: &typst::layout::Frame,
-        x: f32,
-        y: f32,
-        source: &typst::syntax::Source,
-    ) -> Option<std::ops::Range<usize>> {
-        let zero_point = typst::layout::Point::zero();
-        for (point, frame_item) in frame.items() {
-            match frame_item {
-                typst::layout::FrameItem::Text(text_item) => {
-                    let mut dx = 0.0;
-                    for glyph in text_item.glyphs.iter() {
-                        let glyph_width = (glyph.x_advance + glyph.x_offset).at(text_item.size);
-                        let glyph_height = text_item.size;
-
-                        if x > dx + point.x.to_pt() as f32
-                            && x < dx + (point.x + glyph_width).to_pt() as f32
-                            && y > (point.y - glyph_height).to_pt() as f32
-                            && y < point.y.to_pt() as f32
-                        {
-                            if let Some(range) = source.range(glyph.span.0) {
-                                return Some(range);
-                            }
-                            // Some glyphs don't have a range. For example text in backticks?
-                            break;
-                        }
-
-                        dx += glyph_width.to_pt() as f32;
-                    }
-                }
-                typst::layout::FrameItem::Meta(meta, size) => {
-                    if size.to_point() == zero_point {
-                        continue;
-                    }
-                    let typst::introspection::Meta::Elem(content) = meta else {
-                        continue;
-                    };
-
-                    let span = content.span();
-                    let Some(range_in_source_file) = source.range(span) else {
-                        continue;
-                    };
-
-                    if x > point.x.to_pt() as f32
-                        && x < (point.x + size.x).to_pt() as f32
-                        && y > point.y.to_pt() as f32
-                        && y < (point.y + size.y).to_pt() as f32
-                    {
-                        return Some(range_in_source_file);
-                    }
-                }
-                typst::layout::FrameItem::Group(group_item) => {
-                    if let Some(range) = Self::find_source_range_from_xypos(
-                        &group_item.frame,
-                        x - point.x.to_pt() as f32,
-                        y - point.y.to_pt() as f32,
-                        &source,
-                    ) {
-                        return Some(range);
-                    }
-                }
-                _ => {}
-            };
-        }
-        None
-    }
-    pub fn show_document_from_xy_click(
-        &self,
-        x: f32,
-        y: f32,
-        image_scale: f32,
-        viewport_visible_width: f32,
-    ) {
-        // Find the page from which the click came.
-
-        let document = self.document.borrow();
-        let document = document.as_ref().unwrap();
-
-        let (page, x, y) = {
-            let mut relative_y = y;
-            let mut relative_x = x;
-            let mut found_page = None;
-            let mut ypos = 5.0;
-            for page in document.pages.iter() {
-                relative_y = y - ypos;
-                ypos += (page.height().to_pt() as f32) * image_scale;
-                tracing::error!(
-                    "checking -> checking if in page ending at {} (rel y = {})",
-                    ypos,
-                    relative_y
-                );
-                if ypos > y {
-                    let page_width = (page.width().to_pt() as f32) * image_scale;
-                    let page_x = (viewport_visible_width - page_width) / 2.0;
-                    let page_x = page_x.max(0.0);
-                    relative_x = x - page_x;
-                    found_page = Some(page);
-                    break;
-                }
-                ypos += 10.0;
-            }
-            let Some(found_page) = found_page else {
-                return;
-            };
-            (found_page, relative_x, relative_y)
-        };
-        tracing::error!("-> relative y = {}, x = {}", y, x);
-
-        let source = self.source.borrow();
-        let source = source.as_ref().unwrap();
-
-        let Some(typst_range) =
-            Self::find_source_range_from_xypos(page, x / image_scale, y / image_scale, &source)
-        else {
-            tracing::error!("-> found no match :()");
-            return;
-        };
-
-        // Jump to the found source location in the editor
-        let params = ShowDocumentParams {
-            uri: self.source_uri.borrow().as_ref().unwrap().clone(),
-            external: Some(false),
-            take_focus: Some(true),
-            selection: Some(Range {
-                // TODO: does this work with non-ascii?
-                start: Position {
-                    line: source
-                        .byte_to_line(typst_range.start)
-                        .expect("couldn't map start line") as u32,
-                    character: source
-                        .byte_to_column(typst_range.start)
-                        .expect("couldn't map start column") as u32,
-                },
-                end: Position {
-                    line: source
-                        .byte_to_line(typst_range.end)
-                        .expect("couldn't map end line") as u32,
-                    character: source
-                        .byte_to_column(typst_range.end)
-                        .expect("couldn't map end column") as u32,
-                },
-            }),
-        };
-        self.show_document_sender
-            .borrow()
-            .as_ref()
-            .expect("Don't have a show documentsender?")
-            .blocking_send(params)
-            .expect("Could not send show document?");
-    }
-
-    pub fn set_zoom(&self, zoom: f32) {
-        *self.zoom.borrow_mut() = zoom.abs().max(0.3).min(3.0);
-        let len = self.images.borrow().len();
-        *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(len).collect();
-        self.notify.reset();
-
-        self.slint_workaround_redraw();
-    }
-}
-
-impl Model for LazyImagesModel {
-    type Data = slint::Image;
-
-    fn row_count(&self) -> usize {
-        self.images.borrow().len()
-    }
-
-    fn row_data(&self, row: usize) -> Option<Self::Data> {
-        tracing::error!("getting page {} of doc", row);
-
-        let data = self
-            .images
-            .borrow_mut()
-            .get_mut(row)?
-            .get_or_insert_with(|| {
-                tracing::error!("-> rendering page {} of doc", row);
-
-                let document = self.document.borrow();
-                let document = document.as_ref().unwrap();
-
-                let page = document.pages.get(row).unwrap();
-                let zoom = self.zoom.borrow().clone();
-
-                let pixmap = typst_render::render(page, zoom * 3.0, typst::visualize::Color::WHITE);
-                let width = pixmap.width();
-                let height = pixmap.height();
-                let pixel_buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                    &pixmap.take(),
-                    width,
-                    height,
-                );
-
-                slint::Image::from_rgba8_premultiplied(pixel_buffer)
-            })
-            .clone();
-
-        Some(data)
-    }
-
-    fn set_row_data(&self, row: usize, data: Self::Data) {
-        if row < self.row_count() {
-            self.images.borrow_mut()[row] = Some(data);
-            self.notify.row_changed(row);
-        }
-    }
-
-    fn model_tracker(&self) -> &dyn ModelTracker {
-        &self.notify
-    }
-
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-}
-
-thread_local!(static MAIN_WINDOW: MainWindow = MainWindow::new().unwrap());
-
-thread_local!(static IMAGES_MODEL: std::rc::Rc<LazyImagesModel> = MAIN_WINDOW.with(|main_window| {
-        std::rc::Rc::new(LazyImagesModel::new(main_window.as_weak()))
-    })
-);
-
-pub struct Ui {}
-
-impl Ui {
-    pub fn init(show_document_sender: Sender<ShowDocumentParams>) -> Self {
-        // The UI / slint event loop thread
-        thread::spawn(|| {
-            IMAGES_MODEL.with(|model| model.set_show_document_sender(show_document_sender));
-            MAIN_WINDOW.with(|main_window| {
-                IMAGES_MODEL.with(|model| {
-                    main_window.set_image_sources(slint::ModelRc::new(model.clone()))
-                });
-
-                main_window.on_zoom_changed(|zoom| {
-                    IMAGES_MODEL.with(|model| {
-                        model.set_zoom(zoom);
-                    });
-                });
-
-                main_window.on_clicked(|x, y, image_scale, viewport_visible_width| {
-                    tracing::error!(
-                        "click {} {} (scale = {}, viewport width = {})",
-                        x,
-                        y,
-                        image_scale,
-                        viewport_visible_width
-                    );
-                    IMAGES_MODEL.with(|model| {
-                        model.show_document_from_xy_click(x, y, image_scale, viewport_visible_width)
-                    });
-                });
-
-                main_window.run().unwrap();
-            });
-        });
-
-        Ui {}
-    }
-
-    pub async fn show_document(
-        &self,
-        document: Arc<Document>,
-        source: typst::syntax::Source,
-        source_uri: &Url,
-        first_change_range: Option<Range>,
-    ) {
-        let source_uri = source_uri.clone();
-        slint::invoke_from_event_loop(move || {
-            IMAGES_MODEL.with(|model| {
-                // TODO: Can we avoid the source_uri clone?
-                model.set_doc(document, source, source_uri, first_change_range)
-            })
-        })
-        .unwrap();
+    fn overlap(r1: &std::ops::Range<usize>, r2: &std::ops::Range<usize>) -> bool {
+        (r1.start <= r2.end) && (r2.start <= r1.end)
     }
 }
 
