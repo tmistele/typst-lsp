@@ -225,6 +225,13 @@ impl Ui {
         let fut1 = async {
             while let Some(msg) = to_ui_rx.recv().await {
                 tracing::error!("ok, got document!");
+                let mut msg = msg;
+                // Don't waste time rendering old versions.
+                while let Ok(next_msg) = to_ui_rx.try_recv() {
+                    tracing::error!("actually: skipping ahead, got more document!");
+                    msg = next_msg;
+                }
+
                 self.show_document(msg.document, msg.source_uri, msg.first_change_range)
                     .await;
             }
@@ -235,7 +242,24 @@ impl Ui {
                 match ui_request {
                     UiRequest::Render(page_index) => {
                         tracing::error!("got render request for pgae {}", page_index);
-                        self.render_page(page_index, &pixelbuffer_tx).await;
+
+                        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
+                        let document = self.document.lock().unwrap().to_owned();
+
+                        let zoom = self.zoom.lock().unwrap().clone();
+
+                        // Rendering can take a while. So spawn in separate task.
+                        // This allows everything else here to proceed.
+                        // Importantly, receiving documents can proceed!
+                        // So if rendering does take long and lots of new documents come
+                        // in while rendering, we will have the newest version of the document
+                        // received and will as the next step render the newest version (not all
+                        // the already outdated intermediate versions that haven't been received
+                        // yet).
+                        let response_tx = pixelbuffer_tx.clone();
+                        tokio::spawn(async move {
+                            Self::render_page(document, zoom, page_index, response_tx).await
+                        });
                     }
                     UiRequest::JumpFromClick(x, y, image_scale, viewport_visible_width) => {
                         tracing::error!(
@@ -499,17 +523,13 @@ impl Ui {
     }
 
     async fn render_page(
-        &self,
+        document: Arc<Document>,
+        zoom: f32,
         page_index: usize,
-        pixelbuffer_tx: &StdSender<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
+        pixelbuffer_tx: StdSender<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
     ) {
         tracing::error!("-> rendering page {} of doc", page_index);
-
-        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
-        let document = self.document.lock().unwrap().to_owned();
         let page = document.pages.get(page_index).unwrap();
-
-        let zoom = self.zoom.lock().unwrap().clone();
 
         tracing::error!("-> starting typst_render");
         let pixmap = typst_render::render(page, zoom * 3.0, typst::visualize::Color::WHITE);
