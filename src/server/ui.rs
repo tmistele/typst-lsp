@@ -8,8 +8,10 @@ use std::{cell::RefCell, sync::Mutex};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::{Position, Range, ShowDocumentParams, Url};
+use tower_lsp::lsp_types::Position as LspPosition;
+use tower_lsp::lsp_types::{Range, ShowDocumentParams, Url};
 use tower_lsp::Client;
+use typst::layout::Position as TypstPosition;
 use typst::model::Document;
 use typst_ide::Jump;
 
@@ -323,6 +325,7 @@ impl Ui {
 
         // Find jump location from position in that page
         let (tx, rx) = oneshot::channel();
+        let document_for_typst = document.clone(); // Keep `document` alive for later
         self.thread_with_world()
             .await
             .run(move |world| {
@@ -333,8 +336,8 @@ impl Ui {
                 };
                 let jump = typst_ide::jump_from_click(
                     &world,
-                    &document,
-                    &document.pages[page_index],
+                    &document_for_typst,
+                    &document_for_typst.pages[page_index],
                     point,
                 );
                 tx.send(jump).expect("couldn't send jump");
@@ -349,7 +352,7 @@ impl Ui {
         };
 
         // Do the jump
-        let params = match jump {
+        match jump {
             Jump::Source(file_id, position) => {
                 let (uri, source) = {
                     let main_uri = self.source_uri.lock().unwrap();
@@ -367,7 +370,7 @@ impl Ui {
                     (uri, source)
                 };
 
-                let position = Position {
+                let position = LspPosition {
                     line: source
                         .byte_to_line(position)
                         .expect("couldn't map start line") as u32,
@@ -378,7 +381,7 @@ impl Ui {
 
                 tracing::error!("-> jump Source =  {:?}", uri);
 
-                ShowDocumentParams {
+                let params = ShowDocumentParams {
                     uri,
                     external: Some(false),
                     take_focus: Some(true),
@@ -387,18 +390,33 @@ impl Ui {
                         start: position,
                         end: position,
                     }),
-                }
+                };
+
+                self.client
+                    .show_document(params)
+                    .await
+                    .expect("could not show document?");
             }
-            _ => {
-                // TODO: Handle links
-                todo!();
+            Jump::Position(position) => {
+                Self::scroll_ui(&document, self.zoom.lock().unwrap().clone(), &position);
+            }
+            Jump::Url(url) => {
+                let params = ShowDocumentParams {
+                    // TODO: handle this more gracefuly...
+                    uri: Url::parse(url.as_str()).expect("invalid URL?"),
+                    external: Some(true),
+                    take_focus: None,
+                    selection: None,
+                };
+
+                tracing::error!("-> external URL = {:?}", params);
+
+                self.client
+                    .show_document(params)
+                    .await
+                    .expect("could not show document?");
             }
         };
-
-        self.client
-            .show_document(params)
-            .await
-            .expect("could not show document?");
     }
 
     async fn show_document(
@@ -440,44 +458,48 @@ impl Ui {
                 .line_column_to_byte(range.start.line as usize, range.start.character as usize)
                 .unwrap_or_else(|| source.len_bytes() - 1);
             if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor) {
-                tracing::error!("-> got position to scroll to! {:?}", position);
-                // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
-                //       Seems to happen only when scrolling to a different page.
-                //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
-                //       Maybe: It's just the slint "fail to redraw" bug again in some form?
-
-                let page_index = position.page.get() - 1;
-                let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
-                let ypos = position.point.y;
-
-                slint::invoke_from_event_loop(move || {
-                    MAIN_WINDOW.with(move |main_window| {
-                        // Take into account zoom
-                        // Take into account the factor (1.6666666 * 1phx/1px)
-                        let image_scale = zoom * (1.6666666 / main_window.window().scale_factor());
-
-                        // add page offset, take into account zoom
-                        // TODO: this assumes all pages have same height.
-                        let ypos = (ypos.to_pt() as f32) * image_scale
-                            + 5.0
-                            + (page_index as f32) * (page_size * image_scale + 10.0);
-
-                        tracing::error!("scrolling to {:?} on page {:?}", ypos, page_index);
-                        let current_ypos = main_window.get_list_viewport_y().abs();
-                        let current_visible_height = main_window.get_list_visible_height();
-
-                        // Only scroll if `ypos` not not already visible
-                        if ypos < current_ypos || ypos > current_ypos + current_visible_height {
-                            // Don't put the last change at the very top of the viewport.
-                            // Want to see some stuff above last change as well.
-                            let ypos = ypos - current_visible_height * 0.3;
-                            main_window.set_list_viewport_y(-ypos);
-                        }
-                    });
-                })
-                .unwrap();
+                Self::scroll_ui(&document, zoom, &position);
             }
         });
+    }
+
+    fn scroll_ui(document: &Arc<Document>, zoom: f32, position: &TypstPosition) {
+        tracing::error!("-> got position to scroll to! {:?}", position);
+        // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
+        //       Seems to happen only when scrolling to a different page.
+        //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
+        //       Maybe: It's just the slint "fail to redraw" bug again in some form?
+
+        let page_index = position.page.get() - 1;
+        let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
+        let ypos = position.point.y;
+
+        slint::invoke_from_event_loop(move || {
+            MAIN_WINDOW.with(move |main_window| {
+                // Take into account zoom
+                // Take into account the factor (1.6666666 * 1phx/1px)
+                let image_scale = zoom * (1.6666666 / main_window.window().scale_factor());
+
+                // add page offset, take into account zoom
+                // TODO: this assumes all pages have same height.
+                let ypos = (ypos.to_pt() as f32) * image_scale
+                    + 5.0
+                    + (page_index as f32) * (page_size * image_scale + 10.0);
+
+                tracing::error!("scrolling to {:?} on page {:?}", ypos, page_index);
+                let current_ypos = main_window.get_list_viewport_y().abs();
+                let current_visible_height = main_window.get_list_visible_height();
+
+                // Only scroll if `ypos` not not already visible
+                if ypos < current_ypos || ypos > current_ypos + current_visible_height {
+                    // Don't put the last change at the very top of the viewport.
+                    // Want to see some stuff above last change as well.
+                    let ypos = ypos - current_visible_height * 0.3;
+                    main_window.set_list_viewport_y(-ypos);
+                }
+            });
+        })
+        .unwrap();
     }
 
     async fn render_page(
@@ -549,7 +571,6 @@ slint::slint! {
         }
 
         mylist := ListView {
-            // TODO: Handle link clicks
             for image_source in image_sources : Rectangle {
                 // 1/3 for resolution
                 width: (image_source.width/3) * 1px * (1.6666666 * 1phx/1px);
