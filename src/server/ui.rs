@@ -128,7 +128,6 @@ thread_local!(static IMAGES_MODEL: std::rc::Rc<LazyImagesModel> = MAIN_WINDOW.wi
 
 pub struct Ui {
     document: Mutex<Arc<Document>>,
-    frame_hashes: Mutex<Vec<u128>>,
     source_uri: Mutex<Option<Url>>,
     zoom: Mutex<f32>,
     workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>,
@@ -153,7 +152,6 @@ impl Ui {
     pub fn new(workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>, client: Client) -> Self {
         Self {
             document: Default::default(),
-            frame_hashes: Default::default(),
             source_uri: Default::default(),
             zoom: Mutex::new(1.0),
             typst_thread: Default::default(),
@@ -411,17 +409,6 @@ impl Ui {
     ) {
         let new_len = new_doc.pages.len();
 
-        let old_hashes = {
-            let mut frame_hashes = self.frame_hashes.lock().unwrap();
-            std::mem::replace(
-                &mut *frame_hashes,
-                new_doc
-                    .pages
-                    .iter()
-                    .map(|frame| typst::util::hash128(frame))
-                    .collect(),
-            )
-        };
         *self.document.lock().unwrap() = new_doc;
         *self.source_uri.lock().unwrap() = Some(new_source_uri);
 
@@ -430,67 +417,38 @@ impl Ui {
         })
         .unwrap();
 
-        // Find first change and scroll to it
-        // TODO: Maybe use  `typst_ide::jump_from_cursor`
         if let Some(range) = first_change_range {
-            // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
-            let document = self.document.lock().unwrap().to_owned();
+            self.jump_to_first_change(range).await;
+        }
+    }
 
-            let source = {
-                let main_uri = self.source_uri.lock().unwrap();
-                let main_uri = main_uri.as_ref().expect("Do not have a source uri");
-                let workspace = Arc::clone(self.workspace()).read_owned().await;
-                workspace.read_source(&main_uri).unwrap()
-            };
+    async fn jump_to_first_change(&self, range: Range) {
+        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
+        let document = self.document.lock().unwrap().to_owned();
+        let zoom = self.zoom.lock().unwrap().clone();
 
-            // Convert lsp range (line + character) to byte range
-            // TODO: Does that work with non-ascii?
-            let range = std::ops::Range {
-                start: source
-                    .line_column_to_byte(range.start.line as usize, range.start.character as usize)
-                    .unwrap_or_else(|| source.len_bytes() - 1),
-                end: source
-                    .line_column_to_byte(range.end.line as usize, range.end.character as usize)
-                    .unwrap_or_else(|| source.len_bytes() - 1),
-            };
-            tracing::error!("Searching for position of range = {:?}", range);
+        let source = {
+            let main_uri = self.source_uri.lock().unwrap();
+            let main_uri = main_uri.as_ref().expect("Do not have a source uri");
+            let workspace = Arc::clone(self.workspace()).read_owned().await;
+            workspace.read_source(&main_uri).unwrap()
+        };
 
-            let new_hashes = self.frame_hashes.lock().unwrap();
-
-            let mut scroll_target = None;
-
-            // Find position to scroll to
-            for (page_index, page) in document.pages.iter().enumerate() {
-                // Avoid searching through all pages by checking the hashes.
-                if page_index < old_hashes.len() && new_hashes[page_index] == old_hashes[page_index]
-                {
-                    continue;
-                }
-
-                tracing::error!("-> searching in page {}", page_index);
-
-                if let Some(ypos) = Self::find_ypos_from_source_range(page, &range, &source) {
-                    let page_size = page.size().to_point().y.to_pt() as f32;
-                    scroll_target = Some((page_index, page_size, ypos));
-                    break;
-                }
-            }
-
-            // TODO: In a previous version I had a search here in the old document and the old source.
-            //       Use case: Delete a paragraph. This happens in a range that one can't find in the new source!
-            //
-            //       I left it out now for simplicity and because the official web app also doesn't seem to support this.
-            //
-            //       Put it back in?
-
-            // Scroll to found position
-            if let Some((page_index, page_size, ypos)) = scroll_target {
-                let zoom = self.zoom.lock().unwrap().clone();
-
+        // Spawn this since this can wait. Make room for new documents to come in as quickly as possible.
+        tokio::spawn(async move {
+            let cursor = source
+                .line_column_to_byte(range.start.line as usize, range.start.character as usize)
+                .unwrap_or_else(|| source.len_bytes() - 1);
+            if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor) {
+                tracing::error!("-> got position to scroll to! {:?}", position);
                 // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
                 //       Seems to happen only when scrolling to a different page.
                 //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
                 //       Maybe: It's just the slint "fail to redraw" bug again in some form?
+
+                let page_index = position.page.get() - 1;
+                let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
+                let ypos = position.point.y;
 
                 slint::invoke_from_event_loop(move || {
                     MAIN_WINDOW.with(move |main_window| {
@@ -519,7 +477,7 @@ impl Ui {
                 })
                 .unwrap();
             }
-        }
+        });
     }
 
     async fn render_page(
@@ -545,62 +503,6 @@ impl Ui {
         pixelbuffer_tx
             .send(pixel_buffer)
             .expect("sending pixbuf failed");
-    }
-
-    fn find_ypos_from_source_range(
-        frame: &typst::layout::Frame,
-        range: &std::ops::Range<usize>,
-        source: &typst::syntax::Source,
-    ) -> Option<typst::layout::Abs> {
-        let zero_point = typst::layout::Point::zero();
-        for (point, frame_item) in frame.items() {
-            match frame_item {
-                typst::layout::FrameItem::Text(text_item) => {
-                    let glyphs = &text_item.glyphs;
-                    let Some(first_range) = source.range(glyphs.first().unwrap().span.0) else {
-                        continue;
-                    };
-                    let Some(last_range) = source.range(glyphs.last().unwrap().span.0) else {
-                        continue;
-                    };
-                    let total_range = (first_range.start)..(last_range.end);
-
-                    if Self::overlap(range, &total_range) {
-                        return Some(point.y - text_item.size);
-                    }
-                }
-                typst::layout::FrameItem::Meta(meta, size) => {
-                    if size.to_point() == zero_point {
-                        continue;
-                    }
-                    let typst::introspection::Meta::Elem(content) = meta else {
-                        continue;
-                    };
-
-                    let span = content.span();
-                    let Some(range_in_source_file) = source.range(span) else {
-                        continue;
-                    };
-
-                    if Self::overlap(range, &range_in_source_file) {
-                        return Some(point.y);
-                    }
-                }
-                typst::layout::FrameItem::Group(group_item) => {
-                    if let Some(ypos) =
-                        Self::find_ypos_from_source_range(&group_item.frame, &range, &source)
-                    {
-                        return Some(ypos + point.y);
-                    }
-                }
-                _ => {}
-            };
-        }
-        None
-    }
-
-    fn overlap(r1: &std::ops::Range<usize>, r2: &std::ops::Range<usize>) -> bool {
-        (r1.start <= r2.end) && (r2.start <= r1.end)
     }
 }
 
