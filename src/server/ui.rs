@@ -481,7 +481,7 @@ impl Ui {
             let cursor = source
                 .line_column_to_byte(range.start.line as usize, range.start.character as usize)
                 .unwrap_or_else(|| source.len_bytes() - 1);
-            if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor) {
+            if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor + 1) {
                 Self::scroll_ui(&document, zoom, &position);
             }
         });
