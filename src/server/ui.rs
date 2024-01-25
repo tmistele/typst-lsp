@@ -8,6 +8,7 @@ use std::{cell::RefCell, sync::Mutex};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
+use tower_lsp::lsp_types::MessageType;
 use tower_lsp::lsp_types::Position as LspPosition;
 use tower_lsp::lsp_types::{Range, ShowDocumentParams, Url};
 use tower_lsp::Client;
@@ -401,12 +402,35 @@ impl Ui {
                 Self::scroll_ui(&document, self.zoom.lock().unwrap().clone(), &position);
             }
             Jump::Url(url) => {
-                let params = ShowDocumentParams {
-                    // TODO: handle this more gracefuly...
-                    uri: Url::parse(url.as_str()).expect("invalid URL?"),
-                    external: Some(true),
-                    take_focus: None,
-                    selection: None,
+                let params = if let Ok(url) = Url::parse(url.as_str()) {
+                    ShowDocumentParams {
+                        uri: url,
+                        external: Some(true),
+                        take_focus: Some(true),
+                        selection: None,
+                    }
+                } else {
+                    let local_url = self
+                        .source_uri
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("Do not have a source uri")
+                        .join(url.as_str());
+
+                    if let Ok(url) = local_url {
+                        // Heuristic to open .typ files in same editor
+                        let external = Some(!url.as_str().ends_with(".typ"));
+                        ShowDocumentParams {
+                            uri: url,
+                            external,
+                            take_focus: Some(true),
+                            selection: None,
+                        }
+                    } else {
+                        // TODO: Display some kind of feedback in UI?
+                        return;
+                    }
                 };
 
                 tracing::error!("-> external URL = {:?}", params);
