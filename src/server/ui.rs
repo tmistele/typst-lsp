@@ -8,7 +8,6 @@ use std::{cell::RefCell, sync::Mutex};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::MessageType;
 use tower_lsp::lsp_types::Position as LspPosition;
 use tower_lsp::lsp_types::{Range, ShowDocumentParams, Url};
 use tower_lsp::Client;
@@ -147,7 +146,7 @@ pub struct NewDocumentMessage {
 
 pub enum UiRequest {
     Render(usize),
-    JumpFromClick(f32, f32, f32, f32),
+    JumpFromClick(ListViewClick),
     Zoom(f32),
 }
 
@@ -207,14 +206,9 @@ impl Ui {
                         .expect("could not send zoom request");
                 });
 
-                main_window.on_clicked(move |x, y, image_scale, viewport_visible_width| {
+                main_window.on_clicked(move |click: ListViewClick| {
                     jump_click_tx
-                        .blocking_send(UiRequest::JumpFromClick(
-                            x,
-                            y,
-                            image_scale,
-                            viewport_visible_width,
-                        ))
+                        .blocking_send(UiRequest::JumpFromClick(click))
                         .expect("could not send jump click request");
                 });
 
@@ -262,16 +256,9 @@ impl Ui {
                             Self::render_page(document, zoom, page_index, response_tx).await
                         });
                     }
-                    UiRequest::JumpFromClick(x, y, image_scale, viewport_visible_width) => {
-                        tracing::error!(
-                            "got ui click! {} {} {} {}",
-                            x,
-                            y,
-                            image_scale,
-                            viewport_visible_width
-                        );
-                        self.jump_from_click(x, y, image_scale, viewport_visible_width)
-                            .await;
+                    UiRequest::JumpFromClick(click) => {
+                        tracing::error!("got ui click! {:?}", click);
+                        self.jump_from_click(click).await;
                     }
                     UiRequest::Zoom(zoom) => {
                         tracing::error!("got zoom request {}", zoom);
@@ -289,29 +276,29 @@ impl Ui {
         futures::join!(fut1, fut2);
     }
 
-    async fn jump_from_click(&self, x: f32, y: f32, image_scale: f32, viewport_visible_width: f32) {
+    async fn jump_from_click(&self, click: ListViewClick) {
         // Find the page from which the click came.
         let document = self.document.lock().unwrap();
         let document = document.to_owned();
 
-        let (page_index, x, y) = {
-            let mut relative_y = y;
-            let mut relative_x = x;
+        let (page_index, page_x, page_y) = {
+            let mut page_y = click.listview_y;
+            let mut page_x = click.listview_x;
             let mut found_page_index = None;
             let mut ypos = 5.0;
             for (page_index, page) in document.pages.iter().enumerate() {
-                relative_y = y - ypos;
-                ypos += (page.height().to_pt() as f32) * image_scale;
+                page_y = click.listview_y - ypos;
+                ypos += (page.height().to_pt() as f32) * click.image_scale;
                 tracing::error!(
                     "checking -> checking if in page ending at {} (rel y = {})",
                     ypos,
-                    relative_y
+                    page_y
                 );
-                if ypos > y {
-                    let page_width = (page.width().to_pt() as f32) * image_scale;
-                    let page_x = (viewport_visible_width - page_width) / 2.0;
-                    let page_x = page_x.max(0.0);
-                    relative_x = x - page_x;
+                if ypos > click.listview_y {
+                    let page_width = (page.width().to_pt() as f32) * click.image_scale;
+                    let page_position_x = (click.viewport_visible_width - page_width) / 2.0;
+                    let page_position_x = page_position_x.max(0.0);
+                    page_x = click.listview_x - page_position_x;
                     found_page_index = Some(page_index);
                     break;
                 }
@@ -320,9 +307,9 @@ impl Ui {
             let Some(found_page_index) = found_page_index else {
                 return;
             };
-            (found_page_index, relative_x, relative_y)
+            (found_page_index, page_x, page_y)
         };
-        tracing::error!("-> relative y = {}, x = {}", y, x);
+        tracing::error!("-> click relative to page y = {}, x = {}", page_y, page_x);
 
         // Find jump location from position in that page
         let (tx, rx) = oneshot::channel();
@@ -332,8 +319,8 @@ impl Ui {
             .run(move |world| {
                 // `image_scale` takes into account zoom level etc.
                 let point = typst::layout::Point {
-                    x: typst::layout::Abs::pt((x / image_scale).into()),
-                    y: typst::layout::Abs::pt((y / image_scale).into()),
+                    x: typst::layout::Abs::pt((page_x / click.image_scale).into()),
+                    y: typst::layout::Abs::pt((page_y / click.image_scale).into()),
                 };
                 let jump = typst_ide::jump_from_click(
                     &world,
@@ -349,6 +336,8 @@ impl Ui {
         tracing::error!("-> got jump {:?}", jump);
 
         let Some(jump) = jump else {
+            Self::position_highlight(click.x, click.y, HighlightMode::Warning);
+            Self::show_status("Nothing to click here...".into(), HighlightMode::Warning);
             return;
         };
 
@@ -393,13 +382,15 @@ impl Ui {
                     }),
                 };
 
+                Self::position_highlight(click.x, click.y, HighlightMode::Normal);
                 self.client
                     .show_document(params)
                     .await
                     .expect("could not show document?");
             }
             Jump::Position(position) => {
-                Self::scroll_ui(&document, self.zoom.lock().unwrap().clone(), &position);
+                Self::position_highlight(click.x, click.y, HighlightMode::Normal);
+                Self::scroll(&document, self.zoom.lock().unwrap().clone(), &position);
             }
             Jump::Url(url) => {
                 let params = if let Ok(url) = Url::parse(url.as_str()) {
@@ -428,13 +419,18 @@ impl Ui {
                             selection: None,
                         }
                     } else {
-                        // TODO: Display some kind of feedback in UI?
+                        Self::show_status(
+                            format!("Could not parse URL {}", url).into(),
+                            HighlightMode::Warning,
+                        );
                         return;
                     }
                 };
 
                 tracing::error!("-> external URL = {:?}", params);
 
+                Self::position_highlight(click.x, click.x, HighlightMode::Normal);
+                Self::show_status(format!("Opening URL {}", url).into(), HighlightMode::Normal);
                 self.client
                     .show_document(params)
                     .await
@@ -482,12 +478,29 @@ impl Ui {
                 .line_column_to_byte(range.start.line as usize, range.start.character as usize)
                 .unwrap_or_else(|| source.len_bytes() - 1);
             if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor + 1) {
-                Self::scroll_ui(&document, zoom, &position);
+                Self::scroll(&document, zoom, &position);
             }
         });
     }
 
-    fn scroll_ui(document: &Arc<Document>, zoom: f32, position: &TypstPosition) {
+    fn position_highlight(x: f32, y: f32, mode: HighlightMode) {
+        slint::invoke_from_event_loop(move || {
+            // TODO: What if a second event comes in? Should just delay the timer
+            slint::Timer::single_shot(std::time::Duration::from_millis(125), || {
+                MAIN_WINDOW.with(|main_window| {
+                    main_window.set_position_highlight_visible(false);
+                })
+            });
+
+            MAIN_WINDOW.with(move |main_window| {
+                main_window.set_position_highlight(PositionHighlight { x, y, mode });
+                main_window.set_position_highlight_visible(true);
+            });
+        })
+        .unwrap();
+    }
+
+    fn scroll(document: &Arc<Document>, zoom: f32, position: &TypstPosition) {
         tracing::error!("-> got position to scroll to! {:?}", position);
         // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
         //       Seems to happen only when scrolling to a different page.
@@ -550,10 +563,50 @@ impl Ui {
             .send(pixel_buffer)
             .expect("sending pixbuf failed");
     }
+
+    fn show_status(text: slint::SharedString, mode: HighlightMode) {
+        slint::invoke_from_event_loop(move || {
+            // TODO: What if another message comes in? Should reset the timer.
+            slint::Timer::single_shot(std::time::Duration::from_millis(250), || {
+                MAIN_WINDOW.with(|main_window| {
+                    main_window.set_status(Status {
+                        text: "".into(),
+                        mode: HighlightMode::Normal,
+                    });
+                });
+            });
+            MAIN_WINDOW.with(|main_window| {
+                main_window.set_status(Status { text, mode });
+            });
+        })
+        .unwrap();
+    }
 }
 
 slint::slint! {
     import { ListView } from "std-widgets.slint";
+
+    export enum HighlightMode { normal, warning }
+    export struct PositionHighlight {
+        x: length,
+        y: length,
+        mode: HighlightMode,
+    }
+
+    export struct ListViewClick {
+        x: length,
+        y: length,
+        listview_x: length,
+        listview_y: length,
+        image_scale: float,
+        viewport_visible_width: length,
+    }
+
+    export struct Status {
+        text: string,
+        mode: HighlightMode,
+    }
+
     export component MainWindow inherits Window {
         in property <[image]> image_sources;
         in-out property <length> list_viewport_y <=> mylist.viewport-y;
@@ -579,18 +632,20 @@ slint::slint! {
             }
         }
 
-        callback clicked(float, float, float, float);
+        callback clicked(ListViewClick);
         my-touch-area := TouchArea {
             width: mylist.width;
             height: mylist.height;
             clicked => {
-                clicked(
+                clicked({
+                    x: my-touch-area.pressed-x,
+                    y: my-touch-area.pressed-y,
                     // note: viewport offset is negative
-                    (- mylist.viewport-x + my-touch-area.pressed-x) / 1px,
-                    (- mylist.viewport-y + my-touch-area.pressed-y) / 1px,
-                    (1.6666666 * 1phx/1px)*zoom,
-                    mylist.visible-width / 1px,
-               );
+                    listview_x: - mylist.viewport-x + my-touch-area.pressed-x,
+                    listview_y: - mylist.viewport-y + my-touch-area.pressed-y,
+                    image_scale: (1.6666666 * 1phx/1px)*zoom,
+                    viewport_visible_width: mylist.visible-width,
+               });
             }
         }
 
@@ -605,6 +660,42 @@ slint::slint! {
                     source: image_source;
                 }
             }
+        }
+
+        in property <Status> status;
+        Rectangle {
+            height: 20px;
+            width: parent.width;
+            y: parent.height - self.height;
+            background: status.mode == HighlightMode.warning ? rgb(187, 169, 69) : rgb(68, 68, 68);
+            visible: status.text != "";
+            Text {
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: rgb(254, 254, 254);
+                font-size: 10px;
+                text: status.text;
+            }
+        }
+
+        in property <PositionHighlight> position_highlight;
+        in property <bool> position_highlight_visible: false;
+        Rectangle {
+            x: position_highlight.x - self.width/2;
+            y: position_highlight.y - self.height/2;
+            visible: position_highlight_visible;
+            width: 15px;
+            height: 15px;
+            background: @radial-gradient(
+                circle,
+                (
+                    position_highlight.mode == HighlightMode.warning ?
+                        rgb(187, 169, 69) :
+                        rgb(68, 68, 68)
+                ) 0.2 * mod(animation-tick(), 0.3s) / 0.3s,
+                white 0.5 * mod(animation-tick(), 0.3s) / 0.3s + 0.4,
+                transparent
+            );
         }
     }
 }
