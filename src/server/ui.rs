@@ -16,6 +16,7 @@ use typst::model::Document;
 use typst_ide::Jump;
 
 use crate::server::WorldThread;
+use crate::workspace::package::PackageId;
 use crate::workspace::project::Project;
 use crate::workspace::world::typst_thread::TypstThread;
 use crate::workspace::Workspace;
@@ -345,13 +346,26 @@ impl Ui {
         match jump {
             Jump::Source(file_id, position) => {
                 let (uri, source) = {
-                    let main_uri = self.source_uri.lock().unwrap();
-                    let main_uri = main_uri.as_ref().expect("Do not have a source uri");
                     let workspace = Arc::clone(self.workspace()).read_owned().await;
-                    let full_id = workspace.full_id(&main_uri).unwrap();
+                    let package_id = if let Some(package_spec) = file_id.package() {
+                        // TODO: Is there a way to avoid the clone?
+                        PackageId::new_external(package_spec.clone())
+                    } else {
+                        workspace
+                            .full_id(
+                                self.source_uri
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .expect("Do not have a source uri?"),
+                            )
+                            .unwrap()
+                            .package()
+                    };
+
                     let package = workspace
                         .package_manager()
-                        .package(full_id.package())
+                        .package(package_id)
                         .await
                         .expect("package not found?");
                     let uri = package.vpath_to_uri(file_id.vpath()).unwrap();
