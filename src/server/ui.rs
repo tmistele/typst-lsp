@@ -530,10 +530,7 @@ impl Ui {
     ) {
         tracing::error!("-> got position to scroll to! {:?}", position);
         // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
-        //       Seems to happen only when scrolling to a different page.
-        //       Maybe that's b/c scroll happens before that page is (lazily) loaded?
-        //       Maybe: It's just the slint "fail to redraw" bug again in some form?
-
+        //       see https://github.com/slint-ui/slint/issues/4463
         let page_index = position.page.get() - 1;
         let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
         let ypos = position.point.y;
