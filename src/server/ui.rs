@@ -1,4 +1,5 @@
 use once_cell::sync::OnceCell;
+use send_wrapper::SendWrapper;
 use slint::{Model, ModelNotify, ModelTracker};
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
@@ -30,29 +31,24 @@ use crate::workspace::Workspace;
 pub struct LazyImagesModel {
     images: RefCell<Vec<Option<slint::Image>>>,
     notify: ModelNotify,
-    main_window_weak: slint::Weak<MainWindow>,
-    ui_request_tx: RefCell<Option<Sender<UiRequest>>>,
-    pixelbuffer_rx: RefCell<Option<StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>>>,
+    main_window: slint::Weak<MainWindow>,
+    ui_request_tx: Sender<UiRequest>,
+    pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
 }
 
 impl LazyImagesModel {
-    pub fn new(main_window_weak: slint::Weak<MainWindow>) -> Self {
+    pub fn new(
+        main_window: slint::Weak<MainWindow>,
+        ui_request_tx: Sender<UiRequest>,
+        pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
+    ) -> Self {
         LazyImagesModel {
             images: RefCell::new(Vec::new()),
             notify: Default::default(),
-            main_window_weak,
-            ui_request_tx: RefCell::new(None),
-            pixelbuffer_rx: RefCell::new(None),
+            main_window,
+            ui_request_tx,
+            pixelbuffer_rx,
         }
-    }
-
-    pub fn set_rxtx(
-        &self,
-        ui_request_tx: Sender<UiRequest>,
-        pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
-    ) {
-        *self.ui_request_tx.borrow_mut() = Some(ui_request_tx);
-        *self.pixelbuffer_rx.borrow_mut() = Some(pixelbuffer_rx);
     }
 
     fn slint_workaround_redraw(&self) {
@@ -60,7 +56,7 @@ impl LazyImagesModel {
         // https://github.com/slint-ui/slint/issues/3125
         // not sure. the bug fix mentioned there doesn't seem to fix it?
         // only the workaround mentioned there:
-        self.main_window_weak
+        self.main_window
             .upgrade_in_event_loop(move |main_window| {
                 main_window.window().request_redraw();
             })
@@ -90,15 +86,11 @@ impl Model for LazyImagesModel {
             .borrow_mut()
             .get_mut(row)?
             .get_or_insert_with(|| {
-                let tx = self.ui_request_tx.borrow();
-                let tx = tx.as_ref().unwrap();
-                tx.blocking_send(UiRequest::Render(row))
+                self.ui_request_tx
+                    .blocking_send(UiRequest::Render(row))
                     .expect("requesting render failed");
 
-                let rx = self.pixelbuffer_rx.borrow();
-                let rx = rx.as_ref().unwrap();
-
-                let pixel_buffer = rx.recv().expect("receiving pixbuf failed");
+                let pixel_buffer = self.pixelbuffer_rx.recv().expect("receiving pixbuf failed");
                 slint::Image::from_rgba8_premultiplied(pixel_buffer)
             })
             .clone();
@@ -122,13 +114,6 @@ impl Model for LazyImagesModel {
     }
 }
 
-thread_local!(static MAIN_WINDOW: MainWindow = MainWindow::new().unwrap());
-
-thread_local!(static IMAGES_MODEL: std::rc::Rc<LazyImagesModel> = MAIN_WINDOW.with(|main_window| {
-        std::rc::Rc::new(LazyImagesModel::new(main_window.as_weak()))
-    })
-);
-
 pub struct Ui {
     document: Mutex<Arc<Document>>,
     source_uri: Mutex<Option<Url>>,
@@ -137,6 +122,8 @@ pub struct Ui {
     // TODO: Share a typst thread with the `TypstServer`? Like we share a `Workspace`?
     typst_thread: TypstThread,
     client: Client,
+    main_window: slint::Weak<MainWindow>,
+    images_model: Arc<SendWrapper<std::rc::Rc<LazyImagesModel>>>,
 }
 
 pub struct NewDocumentMessage {
@@ -152,15 +139,119 @@ pub enum UiRequest {
 }
 
 impl Ui {
-    pub fn new(workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>, client: Client) -> Self {
-        Self {
+    pub async fn run(
+        workspace: Arc<OnceCell<Arc<RwLock<Workspace>>>>,
+        client: Client,
+        mut to_ui_rx: Receiver<NewDocumentMessage>,
+    ) {
+        let (ui_request_tx, mut ui_request_rx) = channel(10);
+        let (pixelbuffer_tx, pixelbuffer_rx) = std::sync::mpsc::channel();
+
+        let (tx_window_and_model, rx_window_and_model) = tokio::sync::oneshot::channel();
+
+        // The UI / slint event loop thread
+        let jump_click_tx = ui_request_tx.clone();
+        let zoom_tx = ui_request_tx.clone();
+        thread::spawn(|| {
+            let main_window = MainWindow::new().unwrap();
+            let images_model = std::rc::Rc::new(LazyImagesModel::new(
+                main_window.as_weak(),
+                ui_request_tx,
+                pixelbuffer_rx,
+            ));
+
+            main_window.set_image_sources(slint::ModelRc::from(images_model.clone()));
+
+            main_window.on_zoom_changed(move |zoom| {
+                zoom_tx
+                    .blocking_send(UiRequest::Zoom(zoom))
+                    .expect("could not send zoom request");
+            });
+
+            main_window.on_clicked(move |click: ListViewClick| {
+                jump_click_tx
+                    .blocking_send(UiRequest::JumpFromClick(click))
+                    .expect("could not send jump click request");
+            });
+
+            let _ =
+                tx_window_and_model.send((main_window.as_weak(), SendWrapper::new(images_model)));
+
+            main_window.run().unwrap();
+        });
+
+        let (main_window, images_model) = rx_window_and_model.await.unwrap();
+
+        let ui = Self {
             document: Default::default(),
             source_uri: Default::default(),
             zoom: Mutex::new(1.0),
             typst_thread: Default::default(),
             workspace,
             client,
-        }
+            main_window,
+            images_model: Arc::new(images_model),
+        };
+
+        // Wait for documents to come in from LSP
+        let fut1 = async {
+            while let Some(msg) = to_ui_rx.recv().await {
+                tracing::error!("ok, got document!");
+                let mut msg = msg;
+                // Don't waste time rendering old versions.
+                while let Ok(next_msg) = to_ui_rx.try_recv() {
+                    tracing::error!("actually: skipping ahead, got more document!");
+                    msg = next_msg;
+                }
+
+                ui.show_document(msg.document, msg.source_uri, msg.first_change_range)
+                    .await;
+            }
+        };
+        // Wait for render requests to come in from slint UI
+        let fut2 = async {
+            while let Some(ui_request) = ui_request_rx.recv().await {
+                match ui_request {
+                    UiRequest::Render(page_index) => {
+                        tracing::error!("got render request for pgae {}", page_index);
+
+                        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
+                        let document = ui.document.lock().unwrap().to_owned();
+
+                        let zoom = ui.zoom.lock().unwrap().clone();
+
+                        // Rendering can take a while. So spawn in separate task.
+                        // This allows everything else here to proceed.
+                        // Importantly, receiving documents can proceed!
+                        // So if rendering does take long and lots of new documents come
+                        // in while rendering, we will have the newest version of the document
+                        // received and will as the next step render the newest version (not all
+                        // the already outdated intermediate versions that haven't been received
+                        // yet).
+                        let response_tx = pixelbuffer_tx.clone();
+                        tokio::spawn(async move {
+                            Self::render_page(document, zoom, page_index, response_tx).await
+                        });
+                    }
+                    UiRequest::JumpFromClick(click) => {
+                        tracing::error!("got ui click! {:?}", click);
+                        ui.jump_from_click(click).await;
+                    }
+                    UiRequest::Zoom(zoom) => {
+                        tracing::error!("got zoom request {}", zoom);
+                        *ui.zoom.lock().unwrap() = zoom.abs().max(0.3).min(3.0);
+                        let number_pages = ui.document.lock().unwrap().pages.len();
+
+                        let model = Arc::clone(&ui.images_model);
+                        slint::invoke_from_event_loop(move || {
+                            model.reset_all(number_pages);
+                        })
+                        .unwrap();
+                    }
+                }
+            }
+        };
+        futures::join!(fut1, fut2);
     }
 
     fn workspace(&self) -> &Arc<RwLock<Workspace>> {
@@ -185,96 +276,6 @@ impl Ui {
             main_project,
             typst_thread: &self.typst_thread,
         }
-    }
-
-    pub async fn run(&self, mut to_ui_rx: Receiver<NewDocumentMessage>) {
-        let (ui_request_tx, mut ui_request_rx) = channel(10);
-        let (pixelbuffer_tx, pixelbuffer_rx) = std::sync::mpsc::channel();
-
-        // The UI / slint event loop thread
-        let jump_click_tx = ui_request_tx.clone();
-        let zoom_tx = ui_request_tx.clone();
-        thread::spawn(|| {
-            IMAGES_MODEL.with(|model| model.set_rxtx(ui_request_tx, pixelbuffer_rx));
-            MAIN_WINDOW.with(|main_window| {
-                IMAGES_MODEL.with(|model| {
-                    main_window.set_image_sources(slint::ModelRc::new(model.clone()))
-                });
-
-                main_window.on_zoom_changed(move |zoom| {
-                    zoom_tx
-                        .blocking_send(UiRequest::Zoom(zoom))
-                        .expect("could not send zoom request");
-                });
-
-                main_window.on_clicked(move |click: ListViewClick| {
-                    jump_click_tx
-                        .blocking_send(UiRequest::JumpFromClick(click))
-                        .expect("could not send jump click request");
-                });
-
-                main_window.run().unwrap();
-            });
-        });
-
-        // Wait for documents to come in from LSP
-        let fut1 = async {
-            while let Some(msg) = to_ui_rx.recv().await {
-                tracing::error!("ok, got document!");
-                let mut msg = msg;
-                // Don't waste time rendering old versions.
-                while let Ok(next_msg) = to_ui_rx.try_recv() {
-                    tracing::error!("actually: skipping ahead, got more document!");
-                    msg = next_msg;
-                }
-
-                self.show_document(msg.document, msg.source_uri, msg.first_change_range)
-                    .await;
-            }
-        };
-        // Wait for render requests to come in from slint UI
-        let fut2 = async {
-            while let Some(ui_request) = ui_request_rx.recv().await {
-                match ui_request {
-                    UiRequest::Render(page_index) => {
-                        tracing::error!("got render request for pgae {}", page_index);
-
-                        // Don't hold the lock the whole time, just clone the `Arc` (`to_owned()`)
-                        let document = self.document.lock().unwrap().to_owned();
-
-                        let zoom = self.zoom.lock().unwrap().clone();
-
-                        // Rendering can take a while. So spawn in separate task.
-                        // This allows everything else here to proceed.
-                        // Importantly, receiving documents can proceed!
-                        // So if rendering does take long and lots of new documents come
-                        // in while rendering, we will have the newest version of the document
-                        // received and will as the next step render the newest version (not all
-                        // the already outdated intermediate versions that haven't been received
-                        // yet).
-                        let response_tx = pixelbuffer_tx.clone();
-                        tokio::spawn(async move {
-                            Self::render_page(document, zoom, page_index, response_tx).await
-                        });
-                    }
-                    UiRequest::JumpFromClick(click) => {
-                        tracing::error!("got ui click! {:?}", click);
-                        self.jump_from_click(click).await;
-                    }
-                    UiRequest::Zoom(zoom) => {
-                        tracing::error!("got zoom request {}", zoom);
-                        *self.zoom.lock().unwrap() = zoom.abs().max(0.3).min(3.0);
-                        let number_pages = self.document.lock().unwrap().pages.len();
-
-                        slint::invoke_from_event_loop(move || {
-                            IMAGES_MODEL.with(move |model| model.reset_all(number_pages))
-                        })
-                        .unwrap();
-                    }
-                }
-            }
-        };
-        futures::join!(fut1, fut2);
     }
 
     async fn jump_from_click(&self, click: ListViewClick) {
@@ -337,8 +338,8 @@ impl Ui {
         tracing::error!("-> got jump {:?}", jump);
 
         let Some(jump) = jump else {
-            Self::position_highlight(click.x, click.y, HighlightMode::Warning);
-            Self::show_status("Nothing to click here...".into(), HighlightMode::Warning);
+            self.position_highlight(click.x, click.y, HighlightMode::Warning);
+            self.show_status("Nothing to click here...".into(), HighlightMode::Warning);
             return;
         };
 
@@ -396,15 +397,15 @@ impl Ui {
                     }),
                 };
 
-                Self::position_highlight(click.x, click.y, HighlightMode::Normal);
+                self.position_highlight(click.x, click.y, HighlightMode::Normal);
                 self.client
                     .show_document(params)
                     .await
                     .expect("could not show document?");
             }
             Jump::Position(position) => {
-                Self::position_highlight(click.x, click.y, HighlightMode::Normal);
-                Self::scroll(&document, self.zoom.lock().unwrap().clone(), &position);
+                self.position_highlight(click.x, click.y, HighlightMode::Normal);
+                self.scroll(&document, self.zoom.lock().unwrap().clone(), &position);
             }
             Jump::Url(url) => {
                 let params = if let Ok(url) = Url::parse(url.as_str()) {
@@ -433,7 +434,7 @@ impl Ui {
                             selection: None,
                         }
                     } else {
-                        Self::show_status(
+                        self.show_status(
                             format!("Could not parse URL {}", url).into(),
                             HighlightMode::Warning,
                         );
@@ -443,8 +444,8 @@ impl Ui {
 
                 tracing::error!("-> external URL = {:?}", params);
 
-                Self::position_highlight(click.x, click.x, HighlightMode::Normal);
-                Self::show_status(format!("Opening URL {}", url).into(), HighlightMode::Normal);
+                self.position_highlight(click.x, click.x, HighlightMode::Normal);
+                self.show_status(format!("Opening URL {}", url).into(), HighlightMode::Normal);
                 self.client
                     .show_document(params)
                     .await
@@ -464,8 +465,9 @@ impl Ui {
         *self.document.lock().unwrap() = new_doc;
         *self.source_uri.lock().unwrap() = Some(new_source_uri);
 
+        let model = Arc::clone(&self.images_model);
         slint::invoke_from_event_loop(move || {
-            IMAGES_MODEL.with(move |model| model.reset_all(new_len))
+            model.reset_all(new_len);
         })
         .unwrap();
 
@@ -487,34 +489,45 @@ impl Ui {
         };
 
         // Spawn this since this can wait. Make room for new documents to come in as quickly as possible.
+        let main_window = self.main_window.clone();
         tokio::spawn(async move {
             let cursor = source
                 .line_column_to_byte(range.start.line as usize, range.start.character as usize)
                 .unwrap_or_else(|| source.len_bytes() - 1);
             if let Some(position) = typst_ide::jump_from_cursor(&document, &source, cursor + 1) {
-                Self::scroll(&document, zoom, &position);
+                Self::scroll_in_window(main_window, &document, zoom, &position);
             }
         });
     }
 
-    fn position_highlight(x: f32, y: f32, mode: HighlightMode) {
-        slint::invoke_from_event_loop(move || {
-            // TODO: What if a second event comes in? Should just delay the timer
-            slint::Timer::single_shot(std::time::Duration::from_millis(125), || {
-                MAIN_WINDOW.with(|main_window| {
-                    main_window.set_position_highlight_visible(false);
-                })
-            });
+    fn position_highlight(&self, x: f32, y: f32, mode: HighlightMode) {
+        self.main_window
+            .upgrade_in_event_loop(move |main_window| {
+                // TODO: What if a second event comes in? Should just delay the timer
+                let main_window_weak = main_window.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_millis(125), move || {
+                    main_window_weak
+                        .upgrade()
+                        .unwrap()
+                        .set_position_highlight_visible(false);
+                });
 
-            MAIN_WINDOW.with(move |main_window| {
                 main_window.set_position_highlight(PositionHighlight { x, y, mode });
                 main_window.set_position_highlight_visible(true);
-            });
-        })
-        .unwrap();
+            })
+            .unwrap();
     }
 
-    fn scroll(document: &Arc<Document>, zoom: f32, position: &TypstPosition) {
+    fn scroll(&self, document: &Arc<Document>, zoom: f32, position: &TypstPosition) {
+        Self::scroll_in_window(self.main_window.clone(), document, zoom, position);
+    }
+
+    fn scroll_in_window(
+        main_window: slint::Weak<MainWindow>,
+        document: &Arc<Document>,
+        zoom: f32,
+        position: &TypstPosition,
+    ) {
         tracing::error!("-> got position to scroll to! {:?}", position);
         // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
         //       Seems to happen only when scrolling to a different page.
@@ -525,8 +538,8 @@ impl Ui {
         let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
         let ypos = position.point.y;
 
-        slint::invoke_from_event_loop(move || {
-            MAIN_WINDOW.with(move |main_window| {
+        main_window
+            .upgrade_in_event_loop(move |main_window| {
                 // Take into account zoom
                 // Take into account the factor (1.6666666 * 1phx/1px)
                 let image_scale = zoom * (1.6666666 / main_window.window().scale_factor());
@@ -548,9 +561,8 @@ impl Ui {
                     let ypos = ypos - current_visible_height * 0.3;
                     main_window.set_list_viewport_y(-ypos);
                 }
-            });
-        })
-        .unwrap();
+            })
+            .unwrap();
     }
 
     async fn render_page(
@@ -578,22 +590,20 @@ impl Ui {
             .expect("sending pixbuf failed");
     }
 
-    fn show_status(text: slint::SharedString, mode: HighlightMode) {
-        slint::invoke_from_event_loop(move || {
-            // TODO: What if another message comes in? Should reset the timer.
-            slint::Timer::single_shot(std::time::Duration::from_millis(250), || {
-                MAIN_WINDOW.with(|main_window| {
-                    main_window.set_status(Status {
+    fn show_status(&self, text: slint::SharedString, mode: HighlightMode) {
+        self.main_window
+            .upgrade_in_event_loop(move |main_window| {
+                let main_window_weak = main_window.as_weak();
+                // TODO: What if another message comes in? Should reset the timer.
+                slint::Timer::single_shot(std::time::Duration::from_millis(250), move || {
+                    main_window_weak.upgrade().unwrap().set_status(Status {
                         text: "".into(),
                         mode: HighlightMode::Normal,
                     });
                 });
-            });
-            MAIN_WINDOW.with(|main_window| {
                 main_window.set_status(Status { text, mode });
-            });
-        })
-        .unwrap();
+            })
+            .unwrap();
     }
 }
 

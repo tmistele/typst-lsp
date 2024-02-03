@@ -51,8 +51,7 @@ async fn run(lsp_tracing_layer_handle: reload::Handle<Option<LspLayer>, Registry
     });
 
     let server_fut = Server::new(stdin, stdout, socket).serve(service);
-    let ui = Ui::new(workspace, rx.await.unwrap());
-    let ui_fut = ui.run(to_ui_rx);
+    let ui_fut = Ui::run(workspace, rx.await.unwrap(), to_ui_rx);
 
     futures::join!(server_fut, ui_fut);
 }
