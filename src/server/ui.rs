@@ -31,43 +31,26 @@ use crate::workspace::Workspace;
 pub struct LazyImagesModel {
     images: RefCell<Vec<Option<slint::Image>>>,
     notify: ModelNotify,
-    main_window: slint::Weak<MainWindow>,
     ui_request_tx: Sender<UiRequest>,
     pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
 }
 
 impl LazyImagesModel {
     pub fn new(
-        main_window: slint::Weak<MainWindow>,
         ui_request_tx: Sender<UiRequest>,
         pixelbuffer_rx: StdReceiver<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
     ) -> Self {
         LazyImagesModel {
             images: RefCell::new(Vec::new()),
             notify: Default::default(),
-            main_window,
             ui_request_tx,
             pixelbuffer_rx,
         }
     }
 
-    fn slint_workaround_redraw(&self) {
-        // TODO: slint bug workaround
-        // https://github.com/slint-ui/slint/issues/3125
-        // not sure. the bug fix mentioned there doesn't seem to fix it?
-        // only the workaround mentioned there:
-        self.main_window
-            .upgrade_in_event_loop(move |main_window| {
-                main_window.window().request_redraw();
-            })
-            .unwrap();
-    }
-
     pub fn reset_all(&self, new_len: usize) {
         *self.images.borrow_mut() = std::iter::repeat_with(|| None).take(new_len).collect();
         self.notify.reset();
-
-        self.slint_workaround_redraw();
     }
 }
 
@@ -153,13 +136,10 @@ impl Ui {
         let jump_click_tx = ui_request_tx.clone();
         let zoom_tx = ui_request_tx.clone();
         thread::spawn(|| {
-            let main_window = MainWindow::new().unwrap();
-            let images_model = std::rc::Rc::new(LazyImagesModel::new(
-                main_window.as_weak(),
-                ui_request_tx,
-                pixelbuffer_rx,
-            ));
+            let images_model =
+                std::rc::Rc::new(LazyImagesModel::new(ui_request_tx, pixelbuffer_rx));
 
+            let main_window = MainWindow::new().unwrap();
             main_window.set_image_sources(slint::ModelRc::from(images_model.clone()));
 
             main_window.on_zoom_changed(move |zoom| {
