@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Range, Url};
 use tracing::info;
-use typst::foundations::Smart;
 use typst::model::Document;
 
 use super::ui;

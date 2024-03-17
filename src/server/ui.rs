@@ -270,14 +270,14 @@ impl Ui {
             let mut ypos = 5.0;
             for (page_index, page) in document.pages.iter().enumerate() {
                 page_y = click.listview_y - ypos;
-                ypos += (page.height().to_pt() as f32) * click.image_scale;
+                ypos += (page.frame.height().to_pt() as f32) * click.image_scale;
                 tracing::error!(
                     "checking -> checking if in page ending at {} (rel y = {})",
                     ypos,
                     page_y
                 );
                 if ypos > click.listview_y {
-                    let page_width = (page.width().to_pt() as f32) * click.image_scale;
+                    let page_width = (page.frame.width().to_pt() as f32) * click.image_scale;
                     let page_position_x = (click.viewport_visible_width - page_width) / 2.0;
                     let page_position_x = page_position_x.max(0.0);
                     page_x = click.listview_x - page_position_x;
@@ -307,7 +307,7 @@ impl Ui {
                 let jump = typst_ide::jump_from_click(
                     &world,
                     &document_for_typst,
-                    &document_for_typst.pages[page_index],
+                    &document_for_typst.pages[page_index].frame,
                     point,
                 );
                 tx.send(jump).expect("couldn't send jump");
@@ -512,7 +512,7 @@ impl Ui {
         // TODO: sometimes this scrolls to the "correct" location only on the 2nd try/change.
         //       see https://github.com/slint-ui/slint/issues/4463
         let page_index = position.page.get() - 1;
-        let page_size = document.pages[page_index].size().to_point().y.to_pt() as f32;
+        let page_size = document.pages[page_index].frame.size().to_point().y.to_pt() as f32;
         let ypos = position.point.y;
 
         main_window
@@ -549,10 +549,10 @@ impl Ui {
         pixelbuffer_tx: StdSender<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
     ) {
         tracing::error!("-> rendering page {} of doc", page_index);
-        let page = document.pages.get(page_index).unwrap();
+        let frame = &document.pages.get(page_index).unwrap().frame;
 
         tracing::error!("-> starting typst_render");
-        let pixmap = typst_render::render(page, zoom * 3.0, typst::visualize::Color::WHITE);
+        let pixmap = typst_render::render(frame, zoom * 3.0, typst::visualize::Color::WHITE);
         tracing::error!("-> ... done");
         let width = pixmap.width();
         let height = pixmap.height();
